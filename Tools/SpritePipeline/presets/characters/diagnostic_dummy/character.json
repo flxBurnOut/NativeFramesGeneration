@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "character_id": "diagnostic_dummy",
+  "display_name": "Diagnostic Dummy (not game art)",
+  "cell_width": 64,
+  "cell_height": 64,
+  "facing": "right",
+  "reference_frame": "idle_reference.png",
+  "master": null,
+  "palette": null,
+  "silhouette": null,
+  "identity_description": "A simple cyan and navy side-view diagnostic robot with a short straight training blade. Preserve its block proportions and limited colors. This is test data, not production game art.",
+  "anchor": {
+    "x": 32,
+    "ground_y": 57
+  },
+  "safe_margin": 4,
+  "sheet_columns": 4,
+  "transparent_background": true,
+  "qa": {
+    "duplicate_run_length": 3,
+    "area_change_ratio": 0.35,
+    "centroid_shift_px": 4.0,
+    "palette_mismatch_ratio": 0.35,
+    "palette_distance": 48.0,
+    "loop_difference_ratio": 0.35,
+    "ground_y_tolerance_px": 2,
+    "rigid_translation_tolerance_px": 0,
+    "alpha_visible_threshold": 1
+  }
+}

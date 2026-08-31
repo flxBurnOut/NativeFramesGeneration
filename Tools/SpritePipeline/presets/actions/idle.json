@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "action_id": "idle",
+  "display_name": "待机循环",
+  "frame_count": 16,
+  "fps": 8,
+  "loop": true,
+  "grounded": true,
+  "action_description": "A restrained 16-frame breathing idle. Keep frame 1 unchanged; frames 2-8 rise subtly, frame 9 is the peak, and frames 10-16 settle smoothly back toward frame 1.",
+  "locked_constraints": [
+    "fixed side-view camera",
+    "no camera movement",
+    "do not change outfit or equipment",
+    "no additional limbs",
+    "transparent background"
+  ],
+  "loop_constraint": "The last frame must transition smoothly back to the unchanged first frame."
+}

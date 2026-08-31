@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "action_id": "melee_attack",
+  "display_name": "近战攻击",
+  "frame_count": 8,
+  "fps": 12,
+  "loop": false,
+  "grounded": true,
+  "action_description": "One compact melee strike using only the weapon or striking limb in the reference. Keep frame 1 unchanged; frames 2-3 anticipate, 4-5 contact, 6 follows through, and 7-8 recover to frame 1.",
+  "locked_constraints": [
+    "keep the feet on the same ground line",
+    "do not move the whole character across the canvas",
+    "preserve an existing weapon exactly; invent none",
+    "show no target, projectile, text, or impact effect",
+    "preserve outfit, proportions, palette, equipment, and limbs"
+  ]
+}

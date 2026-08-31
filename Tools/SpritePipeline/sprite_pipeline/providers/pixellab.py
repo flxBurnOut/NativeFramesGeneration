@@ -1,0 +1,758 @@
+"""PixelLab Animate with Text v3 provider.
+
+This module implements only PixelLab's documented public REST contract:
+
+* ``POST /v2/animate-with-text-v3`` submits exactly one animation job.
+* ``GET /v2/background-jobs/{job_id}`` polls the asynchronous result.
+
+The POST is never retried after an ambiguous transport outcome because the
+caller cannot know whether a credit-bearing job was accepted. Explicit HTTP
+429/529 rejections and polling GETs may back off at 5/10/20 seconds, at most
+three times. ``httpx`` is imported only when the provider first needs a client, so
+offline fixture workflows do not require importing the networking stack.
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import importlib
+from dataclasses import dataclass
+from typing import Any, Callable, Mapping
+from urllib.parse import quote, urlparse
+
+from sprite_pipeline.errors import (
+    ProviderConfigurationError,
+    ProviderPermanentError,
+    ProviderTemporaryError,
+)
+
+from .base import (
+    DEFAULT_MAX_IMAGE_BYTES,
+    ImagePayloadError,
+    PollResult,
+    PollStatus,
+    ProviderRequest,
+    SpriteProvider,
+    Submission,
+    normalize_base64_image,
+    normalize_image_bytes,
+    redact_provider_payload,
+    structured_error,
+)
+
+
+PIXELLAB_TOTAL_PIXEL_BUDGET = 524_288
+"""Documented ``width * height * frame_count`` limit for animation v3."""
+
+
+@dataclass(frozen=True, slots=True)
+class _JobContext:
+    """In-memory validation context retained after a successful submission."""
+
+    expected_frame_count: int
+    expected_width: int
+    expected_height: int
+
+
+class _ResponseShapeError(ValueError):
+    """Internal signal for a response that cannot satisfy the public contract."""
+
+
+def _load_httpx() -> Any:
+    """Import and return ``httpx`` only when a live HTTP request is needed."""
+
+    try:
+        return importlib.import_module("httpx")
+    except ImportError as exc:  # pragma: no cover - exercised only in minimal installs
+        raise ProviderConfigurationError(
+            "PixelLab provider requires the optional httpx dependency",
+            details={"dependency": "httpx"},
+        ) from exc
+
+
+class PixelLabProvider(SpriteProvider):
+    """Synchronous adapter for PixelLab's asynchronous animation v3 API.
+
+    Args:
+        api_key: PixelLab account token.  It is used only in the Bearer header
+            and is never placed in persisted request or response records.
+        base_url: PixelLab origin or an API root ending in ``/v2``.  The default
+            public origin resolves to ``https://api.pixellab.ai/v2``.
+        request_timeout_seconds: Per-HTTP-request timeout enforced by httpx.
+        poll_interval_seconds: Delay used by :meth:`wait` between pending polls.
+        max_wait_seconds: Total wall-clock budget used by :meth:`wait`.
+        max_response_bytes: Maximum response body/image size accepted in memory.
+        max_get_retries: Number of retries after a GET receives HTTP 429/529.
+            The default three means at most four GET attempts in one ``poll``.
+        retry_backoff_seconds: Initial exponential backoff delay.
+        max_retry_delay_seconds: Upper bound for one GET retry delay.
+        http_client: Optional injected httpx-compatible client for tests.  When
+            omitted, a client is constructed lazily and owned by this provider.
+    """
+
+    name = "pixellab"
+    diagnostic_only = False
+
+    def __init__(
+        self,
+        *,
+        api_key: str | None,
+        base_url: str = "https://api.pixellab.ai",
+        request_timeout_seconds: float = 60.0,
+        poll_interval_seconds: float = 5.0,
+        max_wait_seconds: float = 300.0,
+        max_response_bytes: int = DEFAULT_MAX_IMAGE_BYTES,
+        max_get_retries: int = 3,
+        retry_backoff_seconds: float = 5.0,
+        max_retry_delay_seconds: float = 20.0,
+        http_client: Any | None = None,
+        sleep_fn: Callable[[float], None] | None = None,
+        monotonic_fn: Callable[[], float] | None = None,
+    ) -> None:
+        """Validate configuration without importing httpx or opening a socket."""
+
+        super_kwargs: dict[str, Any] = {
+            "poll_interval_seconds": poll_interval_seconds,
+            "max_wait_seconds": max_wait_seconds,
+        }
+        if sleep_fn is not None:
+            super_kwargs["sleep_fn"] = sleep_fn
+        if monotonic_fn is not None:
+            super_kwargs["monotonic_fn"] = monotonic_fn
+        super().__init__(**super_kwargs)
+
+        token = (api_key or "").strip()
+        if not token:
+            raise ProviderConfigurationError(
+                "PIXELLAB_API_KEY is required for the PixelLab provider"
+            )
+        if request_timeout_seconds <= 0:
+            raise ValueError("request_timeout_seconds must be positive")
+        if max_response_bytes <= 0:
+            raise ValueError("max_response_bytes must be positive")
+        if not 0 <= max_get_retries <= 3:
+            raise ValueError("max_get_retries must be between zero and three")
+        if retry_backoff_seconds <= 0 or max_retry_delay_seconds <= 0:
+            raise ValueError("retry backoff values must be positive")
+
+        normalized_base = base_url.strip().rstrip("/")
+        if not normalized_base.startswith(("https://", "http://")):
+            raise ProviderConfigurationError(
+                "PixelLab base URL must use http or https",
+                details={"base_url": normalized_base},
+            )
+        parsed_base = urlparse(normalized_base)
+        if (
+            parsed_base.scheme != "https"
+            and parsed_base.hostname not in {"127.0.0.1", "localhost", "::1"}
+            and http_client is None
+        ):
+            raise ProviderConfigurationError(
+                "PixelLab base URL must use HTTPS outside loopback",
+                details={"base_url": normalized_base},
+            )
+        self.api_root = normalized_base if normalized_base.endswith("/v2") else f"{normalized_base}/v2"
+        self.request_timeout_seconds = float(request_timeout_seconds)
+        self.max_response_bytes = int(max_response_bytes)
+        self.max_get_retries = int(max_get_retries)
+        self.retry_backoff_seconds = float(retry_backoff_seconds)
+        self.max_retry_delay_seconds = float(max_retry_delay_seconds)
+        self._api_key = token
+        self._client = http_client
+        self._owns_client = False
+        self._jobs: dict[str, _JobContext] = {}
+
+    def __enter__(self) -> "PixelLabProvider":
+        """Return this provider for use as a context manager."""
+
+        return self
+
+    def __exit__(self, _exc_type: Any, _exc: Any, _traceback: Any) -> None:
+        """Close a lazily created client when leaving a context manager."""
+
+        self.close()
+
+    def __del__(self) -> None:
+        """Best-effort cleanup when a short-lived service provider is released."""
+
+        try:
+            self.close()
+        except Exception:
+            # Destructors must never mask interpreter shutdown or user errors.
+            pass
+
+    def close(self) -> None:
+        """Close the owned httpx client; injected clients remain caller-owned."""
+
+        if self._owns_client and self._client is not None:
+            self._client.close()
+            self._client = None
+            self._owns_client = False
+
+    def _get_client(self) -> Any:
+        """Return the injected client or lazily construct an authenticated one."""
+
+        if self._client is None:
+            httpx = _load_httpx()
+            self._client = httpx.Client(
+                headers={
+                    "Authorization": f"Bearer {self._api_key}",
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                },
+                timeout=httpx.Timeout(self.request_timeout_seconds),
+                follow_redirects=False,
+            )
+            self._owns_client = True
+        return self._client
+
+    def submit(self, request: ProviderRequest) -> Submission:
+        """Submit one PixelLab v3 job with only conclusive 429/529 retries.
+
+        Transport failures, timeouts, and malformed 200 responses are reported
+        with ``submission_unknown=True`` and ``safe_to_retry=False`` because the
+        remote service may already have accepted and charged for the job.
+        """
+
+        if len(request.prompt) > 1000:
+            raise ProviderPermanentError(
+                "PixelLab animation action exceeds 1000 characters",
+                details={"action_length": len(request.prompt)},
+            )
+        try:
+            reference = normalize_image_bytes(
+                request.reference_image,
+                max_bytes=self.max_response_bytes,
+                max_width=256,
+                max_height=256,
+                max_pixels=256 * 256,
+            )
+        except ImagePayloadError as exc:
+            raise ProviderPermanentError(
+                "reference image is not a valid PixelLab PNG/JPEG input",
+                details={"reason": str(exc)},
+            ) from exc
+
+        pixel_budget = reference.width * reference.height * request.frame_count
+        if pixel_budget > PIXELLAB_TOTAL_PIXEL_BUDGET:
+            raise ProviderPermanentError(
+                "PixelLab v3 total pixel budget would be exceeded",
+                details={
+                    "width": reference.width,
+                    "height": reference.height,
+                    "frame_count": request.frame_count,
+                    "pixel_budget": pixel_budget,
+                    "maximum": PIXELLAB_TOTAL_PIXEL_BUDGET,
+                },
+            )
+
+        payload: dict[str, Any] = {
+            "first_frame": {
+                "type": "base64",
+                "base64": base64.b64encode(reference.data).decode("ascii"),
+                "format": "png",
+            },
+            "action": request.prompt,
+            "frame_count": request.frame_count,
+            "no_background": request.transparent_background,
+        }
+        if request.seed is not None:
+            payload["seed"] = request.seed
+
+        request_record: dict[str, Any] = {
+            "provider": self.name,
+            "method": "POST",
+            "path": "/v2/animate-with-text-v3",
+            "first_frame": {
+                "type": "base64",
+                "format": "png",
+                "width": reference.width,
+                "height": reference.height,
+                "byte_length": len(reference.data),
+                "sha256": reference.sha256,
+            },
+            "action": request.prompt,
+            "frame_count": request.frame_count,
+            "no_background": request.transparent_background,
+        }
+        if request.seed is not None:
+            request_record["seed"] = request.seed
+
+        httpx = self._httpx_for_errors()
+        timeout_errors = (httpx.TimeoutException,) if httpx is not None else ()
+        request_errors = (httpx.RequestError,) if httpx is not None else ()
+        response: Any | None = None
+        for retry_index in range(self.max_get_retries + 1):
+            try:
+                response = self._get_client().post(
+                    f"{self.api_root}/animate-with-text-v3",
+                    json=payload,
+                )
+            except timeout_errors as exc:
+                raise ProviderTemporaryError(
+                    "PixelLab submission timed out and its remote result is unknown",
+                    details={
+                        "submission_unknown": True,
+                        "safe_to_retry": False,
+                        "error_type": type(exc).__name__,
+                        "request": request_record,
+                    },
+                ) from exc
+            except request_errors as exc:
+                raise ProviderTemporaryError(
+                    "PixelLab submission connection failed and its remote result is unknown",
+                    details={
+                        "submission_unknown": True,
+                        "safe_to_retry": False,
+                        "error_type": type(exc).__name__,
+                        "request": request_record,
+                    },
+                ) from exc
+            if response.status_code not in {429, 529} or retry_index >= self.max_get_retries:
+                break
+            self._sleep(self._retry_delay(response, retry_index))
+
+        assert response is not None
+
+        if response.status_code != 200:
+            self._raise_submission_status(response, request_record)
+
+        try:
+            response_json = self._json_object(response)
+        except _ResponseShapeError as exc:
+            raise ProviderTemporaryError(
+                "PixelLab accepted the HTTP request but returned an unusable submission response",
+                details={
+                    "submission_unknown": True,
+                    "safe_to_retry": False,
+                    "reason": str(exc),
+                    "request": request_record,
+                    "response": self._non_json_response_record(response),
+                },
+            ) from exc
+
+        job_id = response_json.get("background_job_id")
+        status = response_json.get("status", "processing")
+        if not isinstance(job_id, str) or not job_id.strip():
+            raise ProviderTemporaryError(
+                "PixelLab submission response did not contain a background_job_id",
+                details={
+                    "submission_unknown": True,
+                    "safe_to_retry": False,
+                    "response": self._response_record(response_json, response.status_code),
+                },
+            )
+        if not isinstance(status, str) or not status:
+            status = "processing"
+
+        job_id = job_id.strip()
+        self._jobs[job_id] = _JobContext(
+            expected_frame_count=request.frame_count,
+            expected_width=reference.width,
+            expected_height=reference.height,
+        )
+        return Submission(
+            provider=self.name,
+            provider_job_id=job_id,
+            status=status,
+            expected_frame_count=request.frame_count,
+            expected_size=(reference.width, reference.height),
+            request_record=request_record,
+            raw_response=self._response_record(response_json, response.status_code),
+            diagnostic_only=False,
+        )
+
+    def poll(self, provider_job_id: str) -> PollResult:
+        """Poll one PixelLab background job and normalize completed images.
+
+        HTTP 429 and 529 responses are conclusive GET failures and are retried
+        with bounded exponential backoff up to ``max_get_retries`` times.  A
+        transport exception is surfaced immediately as a temporary provider
+        error rather than silently extending the operation.
+        """
+
+        job_id = self._validate_job_id(provider_job_id)
+        response = self._get_with_backoff(job_id)
+        if response.status_code != 200:
+            self._raise_poll_status(response, job_id)
+
+        try:
+            response_json = self._json_object(response)
+        except _ResponseShapeError as exc:
+            return PollResult(
+                provider=self.name,
+                provider_job_id=job_id,
+                status=PollStatus.failed,
+                provider_status="invalid_response",
+                raw_response=self._non_json_response_record(response),
+                error=structured_error(
+                    "provider_contract_error",
+                    "PixelLab poll response was not a bounded JSON object",
+                    reason=str(exc),
+                ),
+            )
+
+        raw_response = self._response_record(response_json, response.status_code)
+        provider_status = response_json.get("status")
+        usage = self._usage_record(response_json.get("usage"))
+        if not isinstance(provider_status, str) or not provider_status:
+            return self._contract_failure(
+                job_id,
+                "invalid_response",
+                raw_response,
+                usage,
+                "PixelLab poll response did not contain a string status",
+            )
+
+        if provider_status == "processing":
+            return PollResult(
+                provider=self.name,
+                provider_job_id=job_id,
+                status=PollStatus.pending,
+                provider_status=provider_status,
+                raw_response=raw_response,
+                usage=usage,
+            )
+        if provider_status == "failed":
+            return PollResult(
+                provider=self.name,
+                provider_job_id=job_id,
+                status=PollStatus.failed,
+                provider_status=provider_status,
+                raw_response=raw_response,
+                usage=usage,
+                error=structured_error(
+                    "provider_job_failed",
+                    "PixelLab reported that the background job failed",
+                    provider_error=response_json.get("last_response"),
+                ),
+            )
+        if provider_status != "completed":
+            return self._contract_failure(
+                job_id,
+                provider_status,
+                raw_response,
+                usage,
+                "PixelLab returned an undocumented background job status",
+                unknown_status=provider_status,
+            )
+
+        return self._completed_result(job_id, response_json, raw_response, usage)
+
+    def _completed_result(
+        self,
+        job_id: str,
+        response_json: Mapping[str, Any],
+        raw_response: dict[str, Any],
+        usage: dict[str, Any],
+    ) -> PollResult:
+        """Validate ``last_response.images`` and create a completed result."""
+
+        last_response = response_json.get("last_response")
+        if not isinstance(last_response, Mapping):
+            return self._contract_failure(
+                job_id,
+                "completed",
+                raw_response,
+                usage,
+                "completed PixelLab job did not contain a last_response object",
+            )
+        image_values = last_response.get("images")
+        if not isinstance(image_values, list) or not image_values:
+            return self._contract_failure(
+                job_id,
+                "completed",
+                raw_response,
+                usage,
+                "completed PixelLab job did not contain last_response.images",
+            )
+
+        context = self._jobs.get(job_id)
+        declared_count = last_response.get("frame_count")
+        if isinstance(declared_count, int) and declared_count != len(image_values):
+            return self._contract_failure(
+                job_id,
+                "completed",
+                raw_response,
+                usage,
+                "PixelLab frame_count disagrees with the number of returned images",
+                declared_frame_count=declared_count,
+                returned_images=len(image_values),
+            )
+        if context is not None and len(image_values) != context.expected_frame_count:
+            return self._contract_failure(
+                job_id,
+                "completed",
+                raw_response,
+                usage,
+                "PixelLab returned a different frame count than requested",
+                expected_frame_count=context.expected_frame_count,
+                returned_images=len(image_values),
+            )
+
+        normalized_images: list[bytes] = []
+        observed_size: tuple[int, int] | None = None
+        for index, value in enumerate(image_values):
+            if isinstance(value, Mapping):
+                image_type = value.get("type", "base64")
+                if image_type != "base64":
+                    return self._contract_failure(
+                        job_id,
+                        "completed",
+                        raw_response,
+                        usage,
+                        "PixelLab returned an unsupported image object type",
+                        frame_index=index,
+                        image_type=image_type,
+                    )
+            try:
+                image = normalize_base64_image(
+                    value,
+                    max_bytes=self.max_response_bytes,
+                    max_width=256,
+                    max_height=256,
+                    max_pixels=256 * 256,
+                )
+            except (ImagePayloadError, TypeError) as exc:
+                return self._contract_failure(
+                    job_id,
+                    "completed",
+                    raw_response,
+                    usage,
+                    "PixelLab returned an invalid PNG/JPEG frame",
+                    frame_index=index,
+                    reason=str(exc),
+                )
+
+            current_size = (image.width, image.height)
+            if observed_size is None:
+                observed_size = current_size
+            elif current_size != observed_size:
+                return self._contract_failure(
+                    job_id,
+                    "completed",
+                    raw_response,
+                    usage,
+                    "PixelLab returned frames with inconsistent dimensions",
+                    frame_index=index,
+                    expected_size=observed_size,
+                    actual_size=current_size,
+                )
+            if context is not None and current_size != (
+                context.expected_width,
+                context.expected_height,
+            ):
+                return self._contract_failure(
+                    job_id,
+                    "completed",
+                    raw_response,
+                    usage,
+                    "PixelLab returned a frame size different from the reference frame",
+                    frame_index=index,
+                    expected_size=(context.expected_width, context.expected_height),
+                    actual_size=current_size,
+                )
+            normalized_images.append(image.data)
+
+        return PollResult(
+            provider=self.name,
+            provider_job_id=job_id,
+            status=PollStatus.completed,
+            provider_status="completed",
+            images=normalized_images,
+            raw_response=raw_response,
+            usage=usage,
+        )
+
+    def _get_with_backoff(self, job_id: str) -> Any:
+        """GET one job, retrying only HTTP 429/529 with bounded backoff."""
+
+        httpx = self._httpx_for_errors()
+        timeout_errors = (httpx.TimeoutException,) if httpx is not None else ()
+        request_errors = (httpx.RequestError,) if httpx is not None else ()
+        url = f"{self.api_root}/background-jobs/{quote(job_id, safe='')}"
+        for retry_index in range(self.max_get_retries + 1):
+            try:
+                response = self._get_client().get(url)
+            except timeout_errors as exc:
+                raise ProviderTemporaryError(
+                    "PixelLab job poll timed out",
+                    details={
+                        "provider_job_id": job_id,
+                        "safe_to_retry": True,
+                        "error_type": type(exc).__name__,
+                    },
+                ) from exc
+            except request_errors as exc:
+                raise ProviderTemporaryError(
+                    "PixelLab job poll connection failed",
+                    details={
+                        "provider_job_id": job_id,
+                        "safe_to_retry": True,
+                        "error_type": type(exc).__name__,
+                    },
+                ) from exc
+
+            if response.status_code not in {429, 529}:
+                return response
+            if retry_index >= self.max_get_retries:
+                raise ProviderTemporaryError(
+                    "PixelLab job poll remained rate-limited after bounded retries",
+                    details={
+                        "provider_job_id": job_id,
+                        "http_status": response.status_code,
+                        "get_retries": self.max_get_retries,
+                        "safe_to_retry": True,
+                        "response": self._best_effort_response_record(response),
+                    },
+                )
+            self._sleep(self._retry_delay(response, retry_index))
+        raise AssertionError("unreachable GET retry state")
+
+    def _retry_delay(self, response: Any, retry_index: int) -> float:
+        """Return a bounded delay, honoring numeric Retry-After when available."""
+
+        exponential = self.retry_backoff_seconds * (2**retry_index)
+        retry_after: float | None = None
+        headers = getattr(response, "headers", {})
+        if isinstance(headers, Mapping):
+            raw_retry_after = headers.get("Retry-After") or headers.get("retry-after")
+            try:
+                retry_after = float(raw_retry_after) if raw_retry_after is not None else None
+            except (TypeError, ValueError):
+                retry_after = None
+        delay = retry_after if retry_after is not None and retry_after >= 0 else exponential
+        return min(delay, self.max_retry_delay_seconds)
+
+    def _httpx_for_errors(self) -> Any | None:
+        """Load httpx exception types, allowing dependency-free injected fakes.
+
+        A caller-supplied client is primarily a test seam.  If httpx is absent,
+        such a client can still exercise pure contract logic; unexpected fake
+        exceptions propagate normally instead of being misclassified as network
+        failures.  A live provider without an injected client still requires
+        httpx through :meth:`_get_client`.
+        """
+
+        try:
+            return _load_httpx()
+        except ProviderConfigurationError:
+            if self._client is not None and not self._owns_client:
+                return None
+            raise
+
+    def _raise_submission_status(self, response: Any, request_record: dict[str, Any]) -> None:
+        """Classify a non-200 POST response without retrying it."""
+
+        status_code = int(response.status_code)
+        details = {
+            "http_status": status_code,
+            "submission_unknown": False,
+            "safe_to_retry": status_code in {429, 529},
+            "request": request_record,
+            "response": self._best_effort_response_record(response),
+        }
+        if status_code in {429, 529} or status_code >= 500:
+            raise ProviderTemporaryError("PixelLab rejected or could not process the submission", details=details)
+        raise ProviderPermanentError("PixelLab rejected the animation submission", details=details)
+
+    def _raise_poll_status(self, response: Any, job_id: str) -> None:
+        """Classify a non-200 poll response after rate-limit retries are exhausted."""
+
+        status_code = int(response.status_code)
+        details = {
+            "provider_job_id": job_id,
+            "http_status": status_code,
+            "safe_to_retry": status_code >= 500,
+            "response": self._best_effort_response_record(response),
+        }
+        if status_code >= 500:
+            raise ProviderTemporaryError("PixelLab job poll failed temporarily", details=details)
+        raise ProviderPermanentError("PixelLab job poll was rejected", details=details)
+
+    def _json_object(self, response: Any) -> dict[str, Any]:
+        """Decode a bounded JSON object from an httpx-compatible response."""
+
+        content = bytes(getattr(response, "content", b""))
+        if len(content) > self.max_response_bytes:
+            raise _ResponseShapeError("response body exceeds the configured byte limit")
+        try:
+            value = response.json()
+        except (ValueError, TypeError) as exc:
+            raise _ResponseShapeError("response body is not valid JSON") from exc
+        if not isinstance(value, Mapping):
+            raise _ResponseShapeError("response JSON root is not an object")
+        return dict(value)
+
+    def _response_record(self, value: Mapping[str, Any], status_code: int) -> dict[str, Any]:
+        """Redact provider JSON and attach the HTTP status for persistence."""
+
+        redacted = redact_provider_payload(value)
+        record = dict(redacted) if isinstance(redacted, Mapping) else {"payload": redacted}
+        record["_http_status"] = int(status_code)
+        return record
+
+    def _non_json_response_record(self, response: Any) -> dict[str, Any]:
+        """Record only metadata and a digest for a non-JSON or oversized body."""
+
+        content = bytes(getattr(response, "content", b""))
+        headers = getattr(response, "headers", {})
+        content_type = headers.get("content-type") if isinstance(headers, Mapping) else None
+        return {
+            "_http_status": int(getattr(response, "status_code", 0)),
+            "content_type": content_type,
+            "byte_length": len(content),
+            "sha256": hashlib.sha256(content).hexdigest(),
+            "body_redacted": True,
+        }
+
+    def _best_effort_response_record(self, response: Any) -> dict[str, Any]:
+        """Return redacted JSON when possible, otherwise safe body metadata."""
+
+        try:
+            value = self._json_object(response)
+        except _ResponseShapeError:
+            return self._non_json_response_record(response)
+        return self._response_record(value, int(response.status_code))
+
+    @staticmethod
+    def _usage_record(value: Any) -> dict[str, Any]:
+        """Keep a redacted JSON-compatible usage mapping or return an empty one."""
+
+        if not isinstance(value, Mapping):
+            return {}
+        redacted = redact_provider_payload(value)
+        return dict(redacted) if isinstance(redacted, Mapping) else {}
+
+    def _contract_failure(
+        self,
+        job_id: str,
+        provider_status: str,
+        raw_response: dict[str, Any],
+        usage: dict[str, Any],
+        message: str,
+        **details: Any,
+    ) -> PollResult:
+        """Return a terminal safe failure for an undocumented response shape."""
+
+        return PollResult(
+            provider=self.name,
+            provider_job_id=job_id,
+            status=PollStatus.failed,
+            provider_status=provider_status,
+            raw_response=raw_response,
+            usage=usage,
+            error=structured_error("provider_contract_error", message, **details),
+        )
+
+    @staticmethod
+    def _validate_job_id(provider_job_id: str) -> str:
+        """Validate and normalize a provider job ID before placing it in a URL."""
+
+        if not isinstance(provider_job_id, str) or not provider_job_id.strip():
+            raise ProviderPermanentError("provider_job_id must be a non-empty string")
+        job_id = provider_job_id.strip()
+        if len(job_id) > 256:
+            raise ProviderPermanentError("provider_job_id exceeds 256 characters")
+        return job_id

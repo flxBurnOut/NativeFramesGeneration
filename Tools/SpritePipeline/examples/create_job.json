@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "character_id": "diagnostic_dummy",
+  "action_id": "idle",
+  "provider": "fixture",
+  "candidate_count": 1,
+  "seed": 0
+}

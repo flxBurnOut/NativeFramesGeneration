@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "action_id": "walk",
+  "display_name": "行走循环",
+  "frame_count": 16,
+  "fps": 5,
+  "loop": true,
+  "grounded": true,
+  "action_description": "A 16-frame in-place walk cycle. Keep frame 1 unchanged; frames 2-8 make the first step, frame 9 the opposite contact, and frames 10-16 make the second step and return.",
+  "locked_constraints": [
+    "animate in place with no horizontal travel",
+    "keep contact feet on the common ground line",
+    "preserve outfit, equipment, proportions, and palette",
+    "preserve every limb and accessory",
+    "keep the full character inside the canvas"
+  ],
+  "loop_constraint": "The last frame must flow into frame 1 with matching body height and momentum."
+}

@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "action_id": "hurt",
+  "display_name": "受击反应",
+  "frame_count": 12,
+  "fps": 12,
+  "loop": true,
+  "grounded": true,
+  "action_description": "A 12-frame hit reaction with no visible source. Keep frame 1 unchanged; frames 2-5 recoil, frame 6 is the strongest pose, and frames 7-12 recover toward frame 1.",
+  "locked_constraints": [
+    "keep the feet near the same ground line",
+    "show no attacker, projectile, text, or impact object",
+    "add no wound, gore, or permanent damage",
+    "preserve outfit, proportions, palette, equipment, and limbs"
+  ],
+  "loop_constraint": "The last frame must connect cleanly to frame 1 because the current game resource loops this animation."
+}

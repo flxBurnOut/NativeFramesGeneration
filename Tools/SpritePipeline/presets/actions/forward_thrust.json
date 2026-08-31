@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "action_id": "forward_thrust",
+  "display_name": "向前突刺",
+  "frame_count": 8,
+  "fps": 12,
+  "loop": false,
+  "grounded": true,
+  "action_description": "Frames 1-2 anticipate. Frame 3 begins a short forward lunge. Frame 4 is the sword contact pose. Frame 5 briefly holds the impact. Frames 6-8 recover to the exact starting stance.",
+  "locked_constraints": [
+    "fixed side-view camera",
+    "no camera movement",
+    "do not change outfit",
+    "do not change weapon length",
+    "no additional limbs",
+    "transparent background"
+  ]
+}

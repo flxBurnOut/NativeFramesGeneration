@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "action_id": "death",
+  "display_name": "倒地死亡",
+  "frame_count": 16,
+  "fps": 12,
+  "loop": false,
+  "grounded": true,
+  "action_description": "A 16-frame non-looping defeat. Keep frame 1 unchanged; frames 2-5 stagger, 6-12 collapse, and frames 13-16 settle into a readable defeated pose with no recovery.",
+  "locked_constraints": [
+    "keep the final body visible and on the original ground line",
+    "no recovery, disappearance, or dissolve",
+    "no gore or dismemberment",
+    "preserve outfit, proportions, palette, equipment, and limbs"
+  ]
+}

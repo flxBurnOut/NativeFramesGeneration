@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "character_id": "cyber_player",
+  "display_name": "Cyber",
+  "cell_width": 128,
+  "cell_height": 128,
+  "facing": "right",
+  "reference_frame": "idle_reference.png",
+  "master": null,
+  "palette": null,
+  "silhouette": null,
+  "identity_description": "Side-view cyber swordsman. Dark fitted armor, cyan energy accents, short dark hair, and one straight energy sword. Preserve the exact outfit, head-to-body ratio, weapon length, and palette from the reference image.",
+  "anchor": {
+    "x": 64,
+    "ground_y": 112
+  },
+  "safe_margin": 4,
+  "sheet_columns": 8,
+  "transparent_background": true,
+  "qa": {
+    "duplicate_run_length": 3,
+    "area_change_ratio": 0.35,
+    "centroid_shift_px": 20.0,
+    "palette_mismatch_ratio": 0.35,
+    "palette_distance": 48.0,
+    "loop_difference_ratio": 0.35,
+    "ground_y_tolerance_px": 4,
+    "rigid_translation_tolerance_px": 0,
+    "alpha_visible_threshold": 1
+  }
+}
