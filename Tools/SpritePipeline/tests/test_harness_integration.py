@@ -24,7 +24,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from sprite_pipeline.errors import ConflictError, ExportBlockedError, ValidationHarnessError
 from sprite_pipeline.models import ActionPreset, CandidateStatus, CharacterPreset, IssueType, JobStatus, ReviewStatus
 from sprite_pipeline.prompts import compose_generation_prompt
-from sprite_pipeline.processing import run_frame_qa
+from sprite_pipeline.processing import build_overlay, run_frame_qa
 from sprite_pipeline.providers.base import (
     PollResult,
     PollStatus,
@@ -362,35 +362,65 @@ class SpritePipelineIntegrationTests(unittest.TestCase):
             )
         )
         action_paths = sorted((PROJECT_ROOT / "presets" / "actions").glob("*.json"))
-        self.assertEqual(len(action_paths), 8)
+        self.assertEqual(len(action_paths), 11)
         for path in action_paths:
             action = ActionPreset.model_validate(json.loads(path.read_text(encoding="utf-8")))
             with self.subTest(action=action.action_id):
                 self.assertLessEqual(len(compose_generation_prompt(character, action)), 1000)
 
-    def test_strict_qa_blocks_whole_sprite_canvas_translation(self) -> None:
+    def test_qa_allows_small_consistent_whole_sprite_motion(self) -> None:
         paths = self.harness.write_sequence(
-            self.root / "shifted_sequence",
-            shifts=(0, 1, 2, 3),
+            self.root / "continuous_sequence",
+            shifts=(0, 3, 6, 9),
         )
         report = run_frame_qa(
             paths,
             expected_count=4,
             expected_size=(64, 64),
-            thresholds={"rigid_translation_tolerance_px": 0},
+            thresholds={"rigid_translation_tolerance_px": 2},
         )
 
         hard_codes = [item["code"] for item in report["hard_failures"]]
-        self.assertIn("frame_anchor_translation", hard_codes)
-        self.assertFalse(report["exportable"])
+        self.assertNotIn("frame_position_jump", hard_codes)
+        self.assertTrue(report["exportable"])
+        self.assertEqual(report["sequence_metrics"]["position_jumps"], [])
         self.assertEqual(
-            report["sequence_metrics"]["rigid_translations"],
-            [
-                {"from": 0, "to": 1, "dx": 1, "dy": 0},
-                {"from": 1, "to": 2, "dx": 1, "dy": 0},
-                {"from": 2, "to": 3, "dx": 1, "dy": 0},
-            ],
+            [item["dx"] for item in report["sequence_metrics"]["rigid_translations"]],
+            [3, 3, 3],
         )
+
+    def test_qa_blocks_abrupt_whole_sprite_position_jump(self) -> None:
+        paths = self.harness.write_sequence(
+            self.root / "jumping_sequence",
+            shifts=(0, 1, 2, 12),
+        )
+        report = run_frame_qa(
+            paths,
+            expected_count=4,
+            expected_size=(64, 64),
+            thresholds={"rigid_translation_tolerance_px": 2},
+        )
+
+        hard_codes = [item["code"] for item in report["hard_failures"]]
+        self.assertIn("frame_position_jump", hard_codes)
+        self.assertFalse(report["exportable"])
+        jumps = report["sequence_metrics"]["position_jumps"]
+        self.assertEqual(len(jumps), 1)
+        self.assertEqual((jumps[0]["from"], jumps[0]["to"]), (2, 3))
+        self.assertEqual((jumps[0]["dx"], jumps[0]["dy"]), (10, 0))
+
+    def test_overlay_compares_each_frame_with_its_immediate_predecessor(self) -> None:
+        paths = self.harness.write_sequence(
+            self.root / "overlay_sequence",
+            shifts=(0, 1, 2, 3),
+        )
+        output = self.root / "adjacent_overlay.png"
+
+        metadata = build_overlay(paths, output, scale=2, columns=2)
+
+        self.assertEqual(metadata["comparison_mode"], "adjacent_frames")
+        self.assertEqual(metadata["pairs"], [[0, 0], [0, 1], [1, 2], [2, 3]])
+        self.assertTrue(output.is_file())
 
     def test_fixture_create_generate_qa_approve_and_export(self) -> None:
         created = self.service.create_job(self.harness.create_request("fixture"))
@@ -401,7 +431,7 @@ class SpritePipelineIntegrationTests(unittest.TestCase):
         candidate = self._candidate(generated)
         self.assertEqual(candidate.status, CandidateStatus.review_ready)
         self.assertEqual(candidate.provider_name, "fixture")
-        self.assertEqual(candidate.provider_model, "diagnostic-anchor-locked-v2")
+        self.assertEqual(candidate.provider_model, "diagnostic-continuity-v2")
         self.assertEqual(len(candidate.frames), 4)
         self.assertEqual(candidate.hard_failures, [])
         self.assertTrue(any(event["event"] == "candidate_checked" for event in generated.events))
@@ -652,6 +682,127 @@ class SpritePipelineIntegrationTests(unittest.TestCase):
         persisted = self.service.get_job(job.job_id)
         self.assertEqual(self._candidate(persisted).status, CandidateStatus.created)
         self.assertEqual(self._candidate(persisted).frames, [])
+
+    def test_five_frame_project_action_keeps_six_provider_sources_and_builds_sparse_preview(self) -> None:
+        action_path = self.harness.action_dir / f"{self.harness.action_id}.json"
+        cells = [[0, 0], [2, 0], [1, 1], [2, 1], [3, 1]]
+        self.harness._write_json(
+            action_path,
+            {
+                "schema_version": 1,
+                "action_id": self.harness.action_id,
+                "display_name": "Five Frame Attack",
+                "frame_count": 5,
+                "provider_frame_count": 6,
+                "provider_frame_selection": [0, 1, 2, 3, 5],
+                "fps": 12,
+                "loop": False,
+                "grounded": True,
+                "sheet_columns": 4,
+                "sheet_rows": 2,
+                "sheet_frame_cells": cells,
+                "centroid_shift_px": 20,
+                "action_description": "Generate a smooth five-beat grounded test attack from six provider poses.",
+                "locked_constraints": ["Keep all neighboring poses and root positions continuous."],
+            },
+        )
+
+        created = self.service.create_job(self.harness.create_request("fixture"))
+        self.assertEqual(created.action.frame_count, 5)
+        self.assertEqual(created.action.generation_frame_count, 6)
+        generated = self.service.generate_job(created.job_id, wait=True)
+        candidate = self._candidate(generated)
+
+        self.assertEqual(len(candidate.frames), 5)
+        raw_dir = self.service.store.job_dir(generated.job_id) / "raw" / "candidate_01"
+        self.assertEqual(len(list((raw_dir / "provider_source").glob("source_frame_*.png"))), 6)
+        manifest = json.loads((raw_dir / "frames_manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["provider_frame_count"], 6)
+        self.assertEqual(manifest["project_frame_count"], 5)
+        self.assertEqual(manifest["provider_frame_selection"], [0, 1, 2, 3, 5])
+        self.assertEqual(
+            [frame["provider_source_index"] for frame in manifest["frames"]],
+            [0, 1, 2, 3, 5],
+        )
+
+        preview = self.service.store.job_dir(generated.job_id) / "previews" / "candidate_01.sheet.png"
+        with Image.open(preview) as opened:
+            sheet = opened.convert("RGBA")
+        self.assertEqual(sheet.size, (256, 128))
+        for column, row in ((1, 0), (3, 0), (0, 1)):
+            alpha = sheet.getchannel("A").crop((column * 64, row * 64, (column + 1) * 64, (row + 1) * 64))
+            self.assertIsNone(alpha.getbbox(), (column, row))
+
+    def test_sparse_project_sheet_imports_in_playback_order_and_exports_same_layout(self) -> None:
+        action_path = self.harness.action_dir / f"{self.harness.action_id}.json"
+        cells = [(0, 0), (2, 0), (1, 1), (2, 1), (3, 1)]
+        self.harness._write_json(
+            action_path,
+            {
+                "schema_version": 1,
+                "action_id": self.harness.action_id,
+                "display_name": "Sparse Project Attack",
+                "frame_count": 5,
+                "provider_frame_count": 6,
+                "provider_frame_selection": [0, 1, 2, 3, 5],
+                "fps": 12,
+                "loop": False,
+                "grounded": True,
+                "sheet_columns": 4,
+                "sheet_rows": 2,
+                "sheet_frame_cells": [list(cell) for cell in cells],
+                "centroid_shift_px": 20,
+                "action_description": "Import and export five smooth grounded poses in the project's sparse grid.",
+            },
+        )
+        source_path = self.root / "incoming" / "sparse_attack.png"
+        source_path.parent.mkdir(parents=True, exist_ok=True)
+        source_sheet = Image.new("RGBA", (256, 128), (0, 0, 0, 0))
+        expected_pixels: list[bytes] = []
+        for index, (column, row) in enumerate(cells):
+            frame_path = self.root / "incoming" / f"sparse_pose_{index}.png"
+            self.harness.write_frame(frame_path, shift_x=index)
+            with Image.open(frame_path) as opened:
+                frame = opened.convert("RGBA").copy()
+            expected_pixels.append(frame.tobytes())
+            source_sheet.alpha_composite(frame, (column * 64, row * 64))
+        source_sheet.save(source_path, format="PNG", optimize=False, compress_level=9)
+
+        created = self.service.create_job(self.harness.create_request("import"))
+        checked = self.service.ingest_candidate(created.job_id, 1, source_path, source_kind="sheet")
+        candidate = self._candidate(checked)
+        self.assertEqual(candidate.status, CandidateStatus.review_ready)
+        actual_pixels = []
+        for frame in candidate.frames:
+            with Image.open(self.service.store.resolve_job_path(checked.job_id, frame.active_path)) as opened:
+                actual_pixels.append(opened.convert("RGBA").tobytes())
+        self.assertEqual(actual_pixels, expected_pixels)
+
+        import_manifest = json.loads(
+            (self.service.store.job_dir(checked.job_id) / "raw" / "candidate_01" / "frames_manifest.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            [(frame["sheet_column"], frame["sheet_row"]) for frame in import_manifest["frames"]],
+            cells,
+        )
+        self.service.approve_candidate(
+            checked.job_id,
+            1,
+            reviewer="sparse-layout-test",
+            acknowledge_warnings=True,
+        )
+        exported = self.service.export_candidate(checked.job_id, 1)
+        assert exported.export is not None
+        exported_sheet = self.root / exported.export.sheet_path
+        with Image.open(exported_sheet) as opened:
+            sheet = opened.convert("RGBA")
+        self.assertEqual(sheet.size, (256, 128))
+        for column, row in ((1, 0), (3, 0), (0, 1)):
+            alpha = sheet.getchannel("A").crop((column * 64, row * 64, (column + 1) * 64, (row + 1) * 64))
+            self.assertIsNone(alpha.getbbox(), (column, row))
+        recipe = json.loads((self.root / exported.export.recipe_path).read_text(encoding="utf-8"))
+        self.assertEqual([tuple(cell) for cell in recipe["frame_cells"]], cells)
+        self.assertEqual([tuple(cell) for cell in recipe["unused_cells"]], [(1, 0), (3, 0), (0, 1)])
 
     def test_hard_failure_blocks_frame_and_candidate_approval_and_export(self) -> None:
         source_dir = self.root / "incoming" / "duplicates"

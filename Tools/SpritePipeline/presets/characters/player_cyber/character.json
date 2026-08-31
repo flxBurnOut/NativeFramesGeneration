@@ -20,7 +20,7 @@
     "loop_difference_ratio": 0.35,
     "palette_distance": 48.0,
     "palette_mismatch_ratio": 0.35,
-    "rigid_translation_tolerance_px": 0
+    "rigid_translation_tolerance_px": 6
   },
   "reference_frame": "idle_reference.png",
   "safe_margin": 4,

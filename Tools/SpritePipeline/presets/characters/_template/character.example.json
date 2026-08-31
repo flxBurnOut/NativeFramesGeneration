@@ -25,7 +25,7 @@
     "palette_distance": 48.0,
     "loop_difference_ratio": 0.35,
     "ground_y_tolerance_px": 4,
-    "rigid_translation_tolerance_px": 0,
+    "rigid_translation_tolerance_px": 6,
     "alpha_visible_threshold": 1
   }
 }

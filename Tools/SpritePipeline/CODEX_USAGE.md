@@ -26,6 +26,14 @@ On Windows, use `harness.cmd` when PowerShell execution policy blocks
    export.
 8. Report the four paths and sheet checksum from `data.job.export`.
 
+For the bundled Cyber Warrior, use action IDs `idle`, `walk`, `jump`, `attack`,
+`attack_in_air`, `hurt`, `backward_evade`, or `death`. Do not reconstruct sheet
+order yourself: the service automatically applies the action's fixed dimensions,
+playback cells, transparent unused cells, runtime FPS, and critical-frame metadata.
+Ground and air attack have five project frames but six provider source frames;
+the raw provider directory preserves all six for audit. `backward_evade` is a new
+asset contract and must not be reported as already wired into the Godot state machine.
+
 ## Statuses Codex must respect
 
 Candidate states are `created`, `submitting`, `provider_pending`, `received`,

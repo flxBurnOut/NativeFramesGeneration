@@ -4,8 +4,13 @@
   "display_name": "行走循环",
   "frame_count": 16,
   "fps": 5,
+  "scene_fps": 5,
   "loop": true,
   "grounded": true,
+  "manifest_action_name": "walk",
+  "sheet_columns": 4,
+  "sheet_rows": 4,
+  "centroid_shift_px": 4,
   "action_description": "A 16-frame in-place walk cycle. Keep frame 1 unchanged; frames 2-8 make the first step, frame 9 the opposite contact, and frames 10-16 make the second step and return.",
   "locked_constraints": [
     "animate in place with no horizontal travel",

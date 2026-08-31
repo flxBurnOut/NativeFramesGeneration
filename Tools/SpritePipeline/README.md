@@ -28,13 +28,15 @@ It never writes into formal game asset directories. Runtime jobs live under
   transport result.
 - Offline `fixture` provider for end-to-end diagnostics without a token. Its
   output is always marked `diagnostic_only` and is not production animation.
-- Import from ordered PNG directories, animated GIFs, and regular Sprite Sheets.
+- Import from ordered PNG directories, animated GIFs, regular Sprite Sheets,
+  and manifest-mapped sparse project sheets.
 - Hard QA gates for count, dimensions, corruption, blank content, source alpha,
-  configurable consecutive duplicate runs, and exact whole-sprite canvas shifts.
+  configurable consecutive duplicate runs, and high-confidence abrupt
+  frame-to-frame position jumps.
 - Character-level warning thresholds for safe margins, area drift, centroid
   jumps, palette deviation, loop closure, and grounded baseline drift.
-- Original/enlarged GIFs, enlarged indexed grid, first-frame overlays, a fixed
-  root-anchor crosshair, and a preview sheet.
+- Original/enlarged GIFs, enlarged indexed grid, adjacent-frame onion skins,
+  project reference lines, and a preview sheet.
 - Explicit per-frame review, whole-candidate approval, two versioned replacement
   attempts per bad frame, and deterministic staged export.
 - Exported PNG, preview GIF, recipe JSON, and QA JSON.
@@ -42,9 +44,14 @@ It never writes into formal game asset directories. Runtime jobs live under
   Review, Frame Repair, and Export, with API/project settings last. Character
   source upload and identity/action prompts are integrated into generation.
 - A bundled Dreamweaver / Cyber Warrior profile: 128×128 RGBA cells, four
-  columns, row-major order, anchor (64,106), real action timing, and filenames.
-- Eight bundled action templates: idle, walk, run, jump, thrust, melee attack,
-  hurt, and death.
+  columns, anchor (64,106), and action-specific sheet height, playback cells,
+  timing, and filenames from the project asset contract.
+- Eleven bundled action templates. The project UI exposes idle, walk, jump,
+  ground attack, air attack, hurt, backward evade, and defeated; three generic
+  templates remain available to API/CLI users.
+- PixelLab keeps its even 4–16 source-frame contract. The five-frame ground and
+  air attacks generate six auditable source frames, then deterministically retain
+  five project frames and export them into the existing sparse grid layouts.
 
 PixelLab Edit Animation V2 and GPT-Image-2 automatic repair are intentionally
 not in V0.1. A repaired PNG can already be inserted with `replace-frame`; this
@@ -220,6 +227,13 @@ python -m unittest discover -s tests -v
 The offline fixture proves storage, QA, review, and export plumbing. A real
 model feasibility run with project characters is still required before treating
 PixelLab as an approved production backend, as required by the original plan.
-The fixture now keeps the complete alpha silhouette at one exact canvas position
-and changes only a few interior RGB pixels. Generation prompts lock the character
-root to the project anchor, while QA blocks confirmed whole-sprite translations.
+The idle fixture keeps the complete alpha silhouette at one canvas position and
+changes only a few interior RGB pixels because idle has no intended root motion.
+Other actions may move naturally. Generation prompts request a smooth
+frame-to-frame root trajectory, while QA blocks high-confidence sudden jumps
+without cropping, resizing, recentering, or changing the fixed cell dimensions.
+Cyber Warrior outputs match the existing assets: 512×512 for idle, walk, and
+defeated; 512×384 for jump, hurt, and air attack; and 512×256 for ground attack
+and the new backward evade. Backward evade is export-ready but still requires a
+new Godot animation/state mapping because it is not present in the supplied
+project manifest.

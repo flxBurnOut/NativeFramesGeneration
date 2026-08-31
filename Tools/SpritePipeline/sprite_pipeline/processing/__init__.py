@@ -16,6 +16,7 @@ from .frame_import import (
     ingest_frames,
 )
 from .preview import (
+    build_adjacent_frame_overlay,
     build_baseline_grid,
     build_first_frame_overlay,
     build_frame_grid,
@@ -28,6 +29,7 @@ from .sheet_export import build_sprite_sheet, export_sprite_sheet
 
 __all__ = [
     "DEFAULT_QA_THRESHOLDS",
+    "build_adjacent_frame_overlay",
     "build_first_frame_overlay",
     "build_frame_grid",
     "build_gif",

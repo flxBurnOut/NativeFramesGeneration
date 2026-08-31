@@ -228,6 +228,86 @@ def build_first_frame_overlay(
     }
 
 
+def build_adjacent_frame_overlay(
+    frames: PathLike | Iterable[PathLike],
+    output_path: PathLike,
+    *,
+    scale: int = 4,
+    columns: int | None = None,
+    previous_opacity: float = 0.55,
+    current_opacity: float = 0.65,
+    padding: int = 8,
+    checker_size: int = 8,
+) -> dict[str, object]:
+    """Overlay each frame with its immediate predecessor for continuity review.
+
+    Previous silhouettes are magenta and current silhouettes are cyan. This
+    preview makes sudden frame-to-frame position changes visible without
+    cropping, translating, resizing, or otherwise modifying source frames.
+    """
+
+    if not isinstance(scale, int) or scale < 1:
+        raise ValueError("scale must be a positive integer.")
+    if not 0.0 <= previous_opacity <= 1.0 or not 0.0 <= current_opacity <= 1.0:
+        raise ValueError("Overlay opacities must be between 0 and 1.")
+    paths, loaded = _load_same_size_frames(frames)
+    ensure_output_is_distinct(output_path, paths)
+    columns = columns or math.ceil(math.sqrt(len(loaded)))
+    if columns < 1:
+        raise ValueError("columns must be at least 1.")
+    rows = math.ceil(len(loaded) / columns)
+    preview_size = (loaded[0].width * scale, loaded[0].height * scale)
+    label_height = 16
+    cell_width = preview_size[0] + padding * 2
+    cell_height = preview_size[1] + padding * 2 + label_height
+    canvas = Image.new("RGBA", (cell_width * columns, cell_height * rows), (24, 24, 28, 255))
+    draw = ImageDraw.Draw(canvas)
+    font = ImageFont.load_default()
+    pairs: list[list[int]] = []
+
+    for index, frame in enumerate(loaded):
+        previous_index = max(0, index - 1)
+        previous = loaded[previous_index].resize(preview_size, _RESAMPLING.NEAREST)
+        current = frame.resize(preview_size, _RESAMPLING.NEAREST)
+        cell_x = (index % columns) * cell_width
+        cell_y = (index // columns) * cell_height
+        board = _checkerboard(preview_size, checker_size)
+        if index > 0:
+            board.alpha_composite(
+                _tint_silhouette(previous, (255, 82, 170), previous_opacity)
+            )
+        board.alpha_composite(
+            _tint_silhouette(current, (74, 232, 255), current_opacity)
+        )
+        canvas.alpha_composite(board, (cell_x + padding, cell_y + padding + label_height))
+        label = f"start {index:03d}" if index == 0 else f"{previous_index:03d} -> {index:03d}"
+        draw.text(
+            (cell_x + padding, cell_y + padding),
+            label,
+            fill=(240, 240, 244, 255),
+            font=font,
+        )
+        pairs.append([previous_index, index])
+
+    target = atomic_save_png(canvas, output_path)
+    return {
+        "schema_version": 1,
+        "output_path": str(target.resolve()),
+        "sha256": sha256_file(target),
+        "comparison_mode": "adjacent_frames",
+        "frame_count": len(loaded),
+        "pairs": pairs,
+        "columns": columns,
+        "rows": rows,
+        "scale": scale,
+        "previous_color": [255, 82, 170],
+        "current_color": [74, 232, 255],
+        "width": canvas.width,
+        "height": canvas.height,
+        "frame_order": [str(path.resolve()) for path in paths],
+    }
+
+
 def build_previews(
     frames: PathLike | Iterable[PathLike],
     output_dir: PathLike,
@@ -237,7 +317,7 @@ def build_previews(
     columns: int | None = None,
     loop: bool = True,
 ) -> dict[str, object]:
-    """Create original/enlarged GIFs, frame grid, and frame-zero overlays."""
+    """Create original/enlarged GIFs, a frame grid, and adjacent overlays."""
 
     paths = resolve_frame_paths(frames)
     target_dir = Path(output_dir).expanduser()
@@ -254,8 +334,8 @@ def build_previews(
     grid = build_frame_grid(
         paths, target_dir / "frame_grid.png", scale=scale, columns=columns
     )
-    overlay = build_first_frame_overlay(
-        paths, target_dir / "first_frame_overlay.png", scale=scale, columns=columns
+    overlay = build_adjacent_frame_overlay(
+        paths, target_dir / "adjacent_frame_overlay.png", scale=scale, columns=columns
     )
     return {
         "schema_version": 1,
@@ -263,6 +343,7 @@ def build_previews(
         "gif_original": original,
         "gif_enlarged": enlarged,
         "frame_grid": grid,
+        "adjacent_frame_overlay": overlay,
         "first_frame_overlay": overlay,
     }
 
@@ -293,7 +374,7 @@ def build_baseline_grid(
     columns: int | None = None,
     padding: int = 8,
 ) -> dict[str, object]:
-    """Create a review grid with the project root-anchor crosshair per cell."""
+    """Create a review grid with a non-binding project reference crosshair."""
 
     paths, loaded = _load_same_size_frames(frame_paths)
     if not 0 <= ground_y < loaded[0].height:
@@ -368,13 +449,9 @@ def build_overlay(
     scale: int = 4,
     columns: int | None = None,
 ) -> dict[str, object]:
-    """Create first-frame onion-skin comparisons and return JSON-safe metadata.
+    """Create adjacent-frame onion-skin comparisons for continuity review."""
 
-    The first frame is composited behind each sequence frame in an indexed grid.
-    This is an audit preview only; input images are never modified.
-    """
-
-    return build_first_frame_overlay(
+    return build_adjacent_frame_overlay(
         frame_paths,
         output_path,
         scale=scale,
@@ -444,3 +521,16 @@ def _with_opacity(image: Image.Image, opacity: float) -> Image.Image:
     adjusted = image.copy()
     adjusted.putalpha(image.getchannel("A").point(lambda value: round(value * opacity)))
     return adjusted
+
+
+def _tint_silhouette(
+    image: Image.Image,
+    color: tuple[int, int, int],
+    opacity: float,
+) -> Image.Image:
+    """Return a solid-colour silhouette while preserving source alpha."""
+
+    alpha = image.getchannel("A").point(lambda value: round(value * opacity))
+    tinted = Image.new("RGBA", image.size, (*color, 0))
+    tinted.putalpha(alpha)
+    return tinted

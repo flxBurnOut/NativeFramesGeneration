@@ -33,6 +33,7 @@ def import_frames(
     cell_height: int | None = None,
     columns: int | None = None,
     frame_count: int | None = None,
+    frame_cells: list[tuple[int, int]] | None = None,
     auto_detect_sheet_count: bool = False,
     clean_hidden_rgb: bool = True,
 ) -> dict[str, object]:
@@ -42,7 +43,8 @@ def import_frames(
     row-major sprite sheet. The source kind is inferred from a directory/GIF;
     a PNG sheet requires ``cell_width`` and ``cell_height`` or explicit
     ``source_type="sheet"``. PNG directories use a natural filename sort, while
-    GIF and sheet frames retain their encoded row-major order.
+    GIF frames retain encoded order. Sheets use row-major order unless an exact
+    playback-order ``frame_cells`` mapping is supplied.
 
     A ``frames_manifest.json`` sidecar records whether each original source had
     alpha. This allows QA to detect a source that was RGB before normalization.
@@ -58,6 +60,8 @@ def import_frames(
         columns: Optional validation of the sheet's physical column count.
         frame_count: Number of row-major sheet cells to import. Omit to import
             every physical cell.
+        frame_cells: Exact ``(column,row)`` cells to import in playback order.
+            All other sheet cells must be transparent.
         auto_detect_sheet_count: For a sheet, import through the last cell with
             visible alpha and omit only trailing transparent padding cells.
             Internal transparent cells retain their row-major indices. This is
@@ -80,12 +84,16 @@ def import_frames(
     if kind == "directory":
         if auto_detect_sheet_count:
             raise ValueError("auto_detect_sheet_count is only valid for sprite sheets.")
+        if frame_cells is not None:
+            raise ValueError("frame_cells is only valid for sprite sheets.")
         if source_path.resolve() == target_dir.resolve():
             raise ValueError("The output directory must differ from the source directory.")
         extracted = _read_png_directory(source_path)
     elif kind == "gif":
         if auto_detect_sheet_count:
             raise ValueError("auto_detect_sheet_count is only valid for sprite sheets.")
+        if frame_cells is not None:
+            raise ValueError("frame_cells is only valid for sprite sheets.")
         extracted = _read_gif(source_path)
     else:
         if cell_width is None or cell_height is None:
@@ -96,6 +104,7 @@ def import_frames(
             cell_height=cell_height,
             columns=columns,
             frame_count=frame_count,
+            frame_cells=frame_cells,
             auto_detect_sheet_count=auto_detect_sheet_count,
         )
 
@@ -167,6 +176,8 @@ def import_frames(
         manifest["cell_width"] = cell_width
         manifest["cell_height"] = cell_height
         manifest["columns"] = columns or extracted[0].get("sheet_columns")
+        if frame_cells is not None:
+            manifest["frame_cells"] = frame_cells
     manifest_path = target_dir / "frames_manifest.json"
     atomic_write_json(manifest, manifest_path)
     manifest["manifest_path"] = str(manifest_path.resolve())
@@ -213,6 +224,7 @@ def import_sprite_sheet(
     cell_height: int,
     columns: int | None = None,
     frame_count: int | None = None,
+    frame_cells: list[tuple[int, int]] | None = None,
     auto_detect_sheet_count: bool = False,
     clean_hidden_rgb: bool = True,
 ) -> dict[str, object]:
@@ -226,6 +238,7 @@ def import_sprite_sheet(
         cell_height=cell_height,
         columns=columns,
         frame_count=frame_count,
+        frame_cells=frame_cells,
         auto_detect_sheet_count=auto_detect_sheet_count,
         clean_hidden_rgb=clean_hidden_rgb,
     )
@@ -239,6 +252,7 @@ def ingest_frames(
     expected_count: int | None,
     source_kind: str = "auto",
     columns: int | None = None,
+    frame_cells: list[tuple[int, int]] | None = None,
     auto_detect_sheet_count: bool = False,
 ) -> list[Path]:
     """Stable harness wrapper that imports and returns ordered output paths.
@@ -288,6 +302,7 @@ def ingest_frames(
         cell_height=cell_height,
         columns=columns,
         frame_count=sheet_frame_count,
+        frame_cells=frame_cells,
         auto_detect_sheet_count=auto_detect_sheet_count,
     )
     records = result.get("frames", [])
@@ -397,6 +412,7 @@ def _read_sprite_sheet(
     cell_height: int,
     columns: int | None,
     frame_count: int | None,
+    frame_cells: list[tuple[int, int]] | None,
     auto_detect_sheet_count: bool,
 ) -> list[dict[str, object]]:
     if cell_width <= 0 or cell_height <= 0:
@@ -427,9 +443,26 @@ def _read_sprite_sheet(
             f"columns={columns} does not match physical sheet columns={physical_columns}."
         )
     total = physical_columns * rows
-    if auto_detect_sheet_count and frame_count is not None:
+    cells = list(frame_cells) if frame_cells is not None else None
+    if cells is not None:
+        if auto_detect_sheet_count:
+            raise ValueError("frame_cells cannot be combined with auto_detect_sheet_count.")
+        if frame_count is not None and frame_count != len(cells):
+            raise ValueError("frame_count must match the number of frame_cells.")
+        if not cells:
+            raise ValueError("frame_cells cannot be empty.")
+        if len(set(cells)) != len(cells):
+            raise ValueError("frame_cells cannot contain duplicate cells.")
+        if any(
+            column < 0 or row < 0 or column >= physical_columns or row >= rows
+            for column, row in cells
+        ):
+            raise ValueError("frame_cells contains a cell outside the physical sheet.")
+        selected_cells = cells
+        count = len(cells)
+    elif auto_detect_sheet_count and frame_count is not None:
         raise ValueError("auto_detect_sheet_count cannot be combined with frame_count.")
-    if auto_detect_sheet_count:
+    elif auto_detect_sheet_count:
         alpha = sheet.getchannel("A")
         count = 0
         for index in range(total - 1, -1, -1):
@@ -448,30 +481,36 @@ def _read_sprite_sheet(
     if count < 1 or count > total:
         raise ValueError(f"frame_count must be between 1 and {total}, got {count}.")
 
-    for unused_index in range(count, total):
-        unused_column = unused_index % physical_columns
-        unused_row = unused_index // physical_columns
-        left = unused_column * cell_width
-        top = unused_row * cell_height
-        unused = sheet.crop((left, top, left + cell_width, top + cell_height))
-        if unused.getchannel("A").getbbox() is not None:
-            raise ValueError(
-                "Unused sprite-sheet cell contains non-transparent pixels at "
-                f"row={unused_row}, column={unused_column}; frame_count may be wrong."
-            )
+    if cells is None:
+        selected_cells = [
+            (index % physical_columns, index // physical_columns)
+            for index in range(count)
+        ]
+    selected_set = set(selected_cells)
+    for unused_row in range(rows):
+        for unused_column in range(physical_columns):
+            if (unused_column, unused_row) in selected_set:
+                continue
+            left = unused_column * cell_width
+            top = unused_row * cell_height
+            unused = sheet.crop((left, top, left + cell_width, top + cell_height))
+            if unused.getchannel("A").getbbox() is not None:
+                raise ValueError(
+                    "Unused sprite-sheet cell contains non-transparent pixels at "
+                    f"row={unused_row}, column={unused_column}; frame_count may be wrong."
+                )
 
     digest = sha256_file(source_sheet)
     records: list[dict[str, object]] = []
-    for index in range(count):
-        column = index % physical_columns
-        row = index // physical_columns
+    for index, (column, row) in enumerate(selected_cells):
         left = column * cell_width
         top = row * cell_height
         frame = sheet.crop((left, top, left + cell_width, top + cell_height))
         records.append(
             {
                 "image": frame,
-                "source_index": index,
+                "source_index": row * physical_columns + column,
+                "sequence_index": index,
                 "source_path": str(source_sheet.resolve()),
                 "source_name": source_sheet.name,
                 "source_mode": original_mode,

@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "action_id": "attack",
+  "display_name": "地面攻击",
+  "frame_count": 5,
+  "provider_frame_count": 6,
+  "provider_frame_selection": [0, 1, 2, 3, 5],
+  "fps": 18,
+  "scene_fps": 18,
+  "loop": false,
+  "grounded": true,
+  "manifest_action_name": "attack",
+  "sheet_columns": 4,
+  "sheet_rows": 2,
+  "sheet_frame_cells": [[0, 0], [2, 0], [1, 1], [2, 1], [3, 1]],
+  "critical_frame_indices": [2],
+  "centroid_shift_px": 13,
+  "action_description": "A six-pose grounded sword attack: ready, wind-up, readable charge, strike, follow-through, recovery. The harness retains five project beats.",
+  "locked_constraints": [
+    "both feet follow one stable ground path",
+    "source frame 3 is the readable charge and skill-freeze pose",
+    "preserve sword length and hand contact",
+    "keep body and sword inside the canvas"
+  ]
+}

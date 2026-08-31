@@ -4,8 +4,13 @@
   "display_name": "待机循环",
   "frame_count": 16,
   "fps": 8,
+  "scene_fps": 8,
   "loop": true,
   "grounded": true,
+  "manifest_action_name": "idle",
+  "sheet_columns": 4,
+  "sheet_rows": 4,
+  "centroid_shift_px": 2,
   "action_description": "A restrained 16-frame breathing idle. Keep frame 1 unchanged; frames 2-8 rise subtly, frame 9 is the peak, and frames 10-16 settle smoothly back toward frame 1.",
   "locked_constraints": [
     "fixed side-view camera",

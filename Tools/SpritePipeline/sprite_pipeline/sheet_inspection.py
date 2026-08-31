@@ -151,6 +151,7 @@ def inspect_sprite_sheet(
         "trailing_empty_cells": physical_columns * rows - frame_count,
         "empty_cells_before_last_frame": gaps,
         "frame_bounds": bounds[:frame_count],
+        "cell_bounds": bounds,
         "has_regular_order": not gaps,
     }
 
@@ -160,8 +161,13 @@ def build_grid_overlay(
     inspection: dict[str, Any],
     *,
     scale: int = 1,
+    frame_cells: list[tuple[int, int]] | tuple[tuple[int, int], ...] | None = None,
 ) -> Image.Image:
-    """Return a checkerboard-backed, numbered grid preview without mutation."""
+    """Return a checkerboard-backed grid preview without mutating the source.
+
+    When ``frame_cells`` is supplied, labels show playback frame numbers rather
+    than physical row-major indices. This makes sparse project sheets readable.
+    """
 
     if scale < 1:
         raise ValueError("scale must be positive")
@@ -179,15 +185,24 @@ def build_grid_overlay(
     columns = int(inspection["columns"])
     rows = int(inspection["rows"])
     frame_count = int(inspection["frame_count"])
+    playback_index = {
+        (int(column), int(row)): index
+        for index, (column, row) in enumerate(frame_cells or ())
+    }
     line = (99, 231, 205, 255)
     for x in range(0, board.width + 1, cell_width):
         draw.line((min(x, board.width - 1), 0, min(x, board.width - 1), board.height - 1), fill=line, width=max(1, scale))
     for y in range(0, board.height + 1, cell_height):
         draw.line((0, min(y, board.height - 1), board.width - 1, min(y, board.height - 1)), fill=line, width=max(1, scale))
     for index in range(columns * rows):
-        x = (index % columns) * cell_width + 5 * scale
-        y = (index // columns) * cell_height + 4 * scale
-        label = f"{index + 1}" if index < frame_count else "empty"
+        column, row = index % columns, index // columns
+        x = column * cell_width + 5 * scale
+        y = row * cell_height + 4 * scale
+        if frame_cells is not None:
+            sequence_index = playback_index.get((column, row))
+            label = f"F{sequence_index + 1}" if sequence_index is not None else "empty"
+        else:
+            label = f"{index + 1}" if index < frame_count else "empty"
         draw.rectangle((x - 2, y - 2, x + 7 * len(label), y + 10), fill=(15, 18, 27, 210))
         draw.text((x, y), label, fill=(245, 248, 255, 255), font=font)
     return board

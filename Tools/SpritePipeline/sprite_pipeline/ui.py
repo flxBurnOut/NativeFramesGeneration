@@ -40,7 +40,8 @@ QA_CODE_CN = {
     "consecutive_duplicate_frames": "连续画面完全重复", "touches_canvas_edge": "角色碰到画布边缘", "safe_margin_violation": "角色离画布边缘过近",
     "area_change": "角色可见面积变化较大", "centroid_jump": "角色重心跳动较大", "palette_deviation": "颜色变化较大",
     "loop_endpoint_difference": "循环首尾差异较大", "ground_baseline_drift": "脚底位置发生跳动", "reference_unavailable": "参考图检查被跳过",
-    "frame_anchor_translation": "整个人物在相邻帧中发生画布位置偏移",
+    "frame_position_jump": "整个人物在相邻帧之间发生突变式跳位",
+    "centroid_velocity_jump": "相邻帧的位置运动趋势发生突变",
     "palette_unavailable": "色板检查被跳过", "preview_generation_failed": "预览图生成失败",
 }
 ISSUE_TYPE_CHOICES = [
@@ -168,10 +169,18 @@ def build_ui(root: str | Path | None = None) -> Any:
         if action is None:
             return _notice("warn", "请选择动作", "动作会自动带入项目的帧数、FPS、循环方式和目标文件名。")
         width, height = action.sheet_size
+        layout = (
+            "按项目指定格位播放，未使用格保持透明"
+            if action.is_sparse
+            else "从左到右、从上到下"
+        )
         body = (
             f"{action.frame_count} 帧 · {action.fps:g} FPS · {'循环播放' if action.loop else '播放一次'}。"
-            f"预计导出 {width}×{height} PNG，{profile.cell_width}×{profile.cell_height}/格，{profile.columns} 列×{action.rows} 行。"
+            f"预计导出 {width}×{height} PNG，{profile.cell_width}×{profile.cell_height}/格，"
+            f"{action.columns} 列×{action.rows} 行；{layout}。"
         )
+        if action.provider_frame_count != action.frame_count:
+            body += f" 模型生成 {action.provider_frame_count} 个连续源帧，Harness 保留为项目需要的 {action.frame_count} 帧。"
         if action.note:
             body += f" {action.note}"
         return _notice("info", f"{action.display_name} → {action.filename}", body)
@@ -456,17 +465,48 @@ def build_ui(root: str | Path | None = None) -> Any:
             result = inspect_sprite_sheet(source, cell_width=profile.cell_width, cell_height=profile.cell_height, columns=profile.columns)
             action = project_action(action_id)
             problems: list[str] = []
-            if result["empty_cells_before_last_frame"]:
-                indices = ", ".join(str(index + 1) for index in result["empty_cells_before_last_frame"])
-                problems.append(f"第 {indices} 格为空；规则 Sheet 不能在有效帧中间留空")
             if action is None:
                 problems.append("还没有选择动画类型")
-            elif result["frame_count"] != action.frame_count:
-                problems.append(f"识别到 {result['frame_count']} 帧，但“{action.display_name}”应为 {action.frame_count} 帧")
+            else:
+                expected_width, expected_height = action.sheet_size
+                if (result["width"], result["height"]) != (expected_width, expected_height):
+                    problems.append(
+                        f"图片是 {result['width']}×{result['height']}，但“{action.display_name}”必须是 "
+                        f"{expected_width}×{expected_height}"
+                    )
+                cell_bounds = result["cell_bounds"]
+                expected_cells = set(action.frame_cells)
+                missing_frames = [
+                    index + 1
+                    for index, (column, row) in enumerate(action.frame_cells)
+                    if row * result["columns"] + column >= len(cell_bounds)
+                    or cell_bounds[row * result["columns"] + column] is None
+                ]
+                occupied_cells = {
+                    (index % result["columns"], index // result["columns"])
+                    for index, bounds in enumerate(cell_bounds)
+                    if bounds is not None
+                }
+                unexpected_cells = sorted(occupied_cells - expected_cells, key=lambda cell: (cell[1], cell[0]))
+                if missing_frames:
+                    problems.append("项目播放帧 F" + "、F".join(str(index) for index in missing_frames) + " 为空")
+                if unexpected_cells:
+                    labels = "、".join(f"第 {row + 1} 行第 {column + 1} 格" for column, row in unexpected_cells)
+                    problems.append(f"应为透明空格的位置仍有画面：{labels}")
+            occupied_count = sum(bounds is not None for bounds in result["cell_bounds"])
+            order_text = (
+                " → ".join(
+                    f"F{index + 1}=第{row + 1}行第{column + 1}格"
+                    for index, (column, row) in enumerate(action.frame_cells)
+                )
+                if action is not None
+                else "选择动作后显示"
+            )
             summary = (
                 '<div class="section-intro"><h3>网格预检</h3>'
                 f"<p>图片尺寸：{result['width']}×{result['height']}；已识别：{profile.cell_width}×{profile.cell_height}/格 · "
-                f"{result['columns']} 列×{result['rows']} 行 · {result['frame_count']} 个有效帧。读取顺序：从左到右、从上到下。</p>"
+                f"{result['columns']} 列×{result['rows']} 行 · {occupied_count} 个有内容的格。</p>"
+                f"<p>实际播放顺序：{_escape(order_text)}</p>"
             )
             if problems:
                 summary += f'<div class="notice error"><strong>暂时不能加入检查</strong>{_escape("；".join(problems))}</div>'
@@ -475,7 +515,11 @@ def build_ui(root: str | Path | None = None) -> Any:
                 summary += f'<div class="notice ok"><strong>与项目规格一致</strong>将按“{_escape(action.display_name)}”的 {action.fps:g} FPS、{"循环" if action.loop else "单次"}方式进入检查。</div>'
             summary += "</div>"
             state = {**result, "valid": not problems, "action_id": action_id}
-            return build_grid_overlay(source, result), summary, state, gr.update(interactive=not problems)
+            return build_grid_overlay(
+                source,
+                result,
+                frame_cells=action.frame_cells if action is not None else None,
+            ), summary, state, gr.update(interactive=not problems)
         except Exception as exc:
             return None, _notice("error", "无法识别这张 Sheet", _human_error(exc)), {}, gr.update(interactive=False)
 
@@ -489,7 +533,6 @@ def build_ui(root: str | Path | None = None) -> Any:
                 raise ValidationHarnessError("上传文件或动画类型已变化，请重新进行网格预检")
             job = service.create_job(GenerationRequest(
                 character_id=profile.character_id, action_id=action_id, provider="import", candidate_count=1,
-                frame_count=int(inspection["frame_count"]),
             ))
             job = service.ingest_candidate(job.job_id, 1, source, source_kind="sheet", columns=profile.columns)
             return _notice("ok", "Sheet 已切分并加入检查", "请继续在本页播放整段动画，再决定采用或修补。"), {"ok": True, "job": job.model_dump(mode="json")}, review_job_update(job.job_id), *review_payload(job.job_id)
@@ -613,8 +656,16 @@ def build_ui(root: str | Path | None = None) -> Any:
             if selected is None:
                 return empty
             candidate = next(item for item in job.candidates if item.candidate_index == selected)
-            columns, rows = job.character.sheet_columns, math.ceil(len(candidate.frames) / job.character.sheet_columns)
+            columns = job.action.sheet_columns or job.character.sheet_columns
+            rows = job.action.sheet_rows or math.ceil(len(candidate.frames) / columns)
             width, height = job.character.cell_width * columns, job.character.cell_height * rows
+            frame_cells = job.action.frame_cells
+            regular_cells = [(index % columns, index // columns) for index in range(len(candidate.frames))]
+            order_text = (
+                "按项目指定格位读取（透明空格不参与播放）"
+                if frame_cells and frame_cells != regular_cells
+                else "从左到右、从上到下"
+            )
             try:
                 action = profile.action(job.action.action_id)
                 filename = action.filename if job.character.character_id == profile.character_id else f"{job.character.character_id}_{job.action.action_id}.png"
@@ -622,7 +673,8 @@ def build_ui(root: str | Path | None = None) -> Any:
                 filename = f"{job.character.character_id}_{job.action.action_id}.png"
             summary = (
                 '<div class="section-intro"><h3>最终 Sprite Sheet</h3>'
-                f"<p>输出尺寸：{width}×{height}；单帧：{job.character.cell_width}×{job.character.cell_height}；排列：{columns} 列×{rows} 行；顺序：从左到右、从上到下；背景：透明 RGBA。</p>"
+                f"<p>输出尺寸：{width}×{height}；单帧：{job.character.cell_width}×{job.character.cell_height}；"
+                f"排列：{columns} 列×{rows} 行；顺序：{order_text}；背景：透明 RGBA。</p>"
                 '<div class="notice info"><strong>关于位置对齐</strong>每帧保留完整画布，不会紧贴角色裁切，也不会逐帧自动居中。导出会保持你在检查页确认过的坐标。</div></div>'
             )
             prefix = service.store.job_dir(job.job_id) / "previews" / candidate.candidate_id
@@ -674,12 +726,12 @@ def build_ui(root: str | Path | None = None) -> Any:
         header_status = gr.HTML(header_status_html())
         with gr.Tabs(elem_classes=["workflow-tabs"]):
             with gr.Tab("指引与示例", id="example"):
-                gr.HTML('<div class="section-intro"><h2>先从这里了解完整流程</h2><p>真正生成时，你需要提供角色原型图、角色外观提示词和本次动作提示词。这里使用流程测试机器人和固定锚点状态灯帧解释动画帧与最终 Sheet；它不联网、不消耗额度，也不代表真实生成质量。示例中每帧人物始终处在同一画布位置。</p></div><div class="contract-grid"><div class="contract-card"><small>角色原型图</small><b>模型生成动作时必须保持的角色形象</b></div><div class="contract-card"><small>固定锚点</small><b>每一帧都锁定同一水平中心与脚底位置</b></div><div class="contract-card"><small>Sprite Sheet</small><b>把等大动画帧按规则排进一张 PNG</b></div></div>')
+                gr.HTML('<div class="section-intro"><h2>先从这里了解完整流程</h2><p>真正生成时，你需要提供角色原型图、角色外观提示词和本次动作提示词。这里使用流程测试机器人解释动画帧与最终 Sheet；它不联网、不消耗额度，也不代表真实生成质量。待机示例没有位移动作，所以保持原位；其他动作允许自然、连续地移动。</p></div><div class="contract-grid"><div class="contract-card"><small>角色原型图</small><b>模型生成动作时必须保持的角色形象</b></div><div class="contract-card"><small>位置连续性</small><b>允许自然移动，不允许相邻帧突然跳位</b></div><div class="contract-card"><small>Sprite Sheet</small><b>固定大小网格，不逐帧裁剪或强制居中</b></div></div>')
                 run_demo_button = gr.Button("运行离线示例", variant="primary", elem_classes=["primary-action"]); demo_status = gr.HTML()
                 with gr.Accordion("示例任务详情", open=False): demo_details = gr.JSON()
 
             with gr.Tab("生成动画", id="generate"):
-                gr.HTML('<div class="section-intro"><h2>从角色原型生成动作</h2><p>这一步已经包含“导入”：先上传角色原型 PNG，再填写角色外观提示词和本次动作提示词。生成时会要求模型锁定画布锚点；生成完成后，结果会直接进入“播放检查”。</p><div class="contract-grid"><div class="contract-card"><small>输入 1</small><b>角色原型 PNG</b></div><div class="contract-card"><small>输入 2</small><b>角色外观 + 动作提示词</b></div><div class="contract-card"><small>生成结果</small><b>固定网格、固定锚点的动画候选</b></div></div></div>')
+                gr.HTML('<div class="section-intro"><h2>从角色原型生成动作</h2><p>这一步已经包含“导入”：先上传角色原型 PNG，再填写角色外观提示词和本次动作提示词。生成时会要求模型保持相邻帧的位置轨迹连续，但不会把人物强制钉在画布中央；生成完成后，结果会直接进入“播放检查”。</p><div class="contract-grid"><div class="contract-card"><small>输入 1</small><b>角色原型 PNG</b></div><div class="contract-card"><small>输入 2</small><b>角色外观 + 动作提示词</b></div><div class="contract-card"><small>生成结果</small><b>固定网格、前后连续的动画候选</b></div></div></div>')
                 ai_api_banner = gr.HTML(api_banner_html())
                 with gr.Row():
                     with gr.Column():
@@ -715,7 +767,7 @@ def build_ui(root: str | Path | None = None) -> Any:
                 with gr.Accordion("技术详情（排错时再看）", open=False): generation_details = gr.JSON(label="任务记录")
 
             with gr.Tab("播放检查", id="review"):
-                gr.HTML('<div class="section-intro"><h2>播放与检查</h2><p>先按游戏速度看整段，再点击单帧。重点观察动作是否连贯、人物是否相对固定锚点抖动、脸或武器是否突然变化、背景是否透明。检测到整个人物在画布内平移时，会直接阻止采用和导出。</p></div>')
+                gr.HTML('<div class="section-intro"><h2>播放与检查</h2><p>先按游戏速度看整段，再点击单帧。重点观察前一帧和后一帧的动作与位置能否接上、脸或武器是否突然变化、背景是否透明。角色可以连续移动；只有突变式跳位才会被拦截。画布外框始终保持不变。</p></div>')
                 with gr.Accordion("检查一张已有 Sprite Sheet", open=False):
                     gr.Markdown("如果动画不是刚刚由本工具生成，而是你已经拥有的一张 Sheet，请在这里上传。它只会被切分并送入本页检查，不会作为角色原型参与生成。")
                     with gr.Row():
@@ -723,7 +775,7 @@ def build_ui(root: str | Path | None = None) -> Any:
                             import_file = gr.File(label="已有 Sprite Sheet（PNG）", file_count="single", file_types=[".png"], type="filepath")
                             import_action = gr.Dropdown(actions, value=None, label="这是什么动画？（必须确认）", filterable=False, elem_classes=["static-choice"])
                             gr.Markdown("请按动画含义选择，不能只看帧数：16 帧可能是待机或行走，12 帧可能是跳跃或受击。")
-                            gr.Markdown("检查规格锁定为 **128×128/格、4 列、RGBA、按行读取**。")
+                            gr.Markdown("检查规格锁定为 **128×128/格、4 列、RGBA**；图片高度、透明空格和实际播放格位会随所选动作自动核对。")
                         with gr.Column(scale=2):
                             import_grid_preview = gr.Image(label="切分网格预览", type="pil", interactive=False, elem_classes=["sheet-preview"])
                     import_inspection = gr.HTML(_notice("info", "等待已有 Sheet", "上传后先确认网格和动作类型。")); import_state = gr.State({})
@@ -745,11 +797,11 @@ def build_ui(root: str | Path | None = None) -> Any:
                     issue_type = gr.Dropdown(ISSUE_TYPE_CHOICES, value="other", label="如果有问题，主要是什么？", filterable=False, elem_classes=["static-choice"])
                     review_note = gr.Textbox(label="问题说明（可选）", placeholder="例如：剑在这一帧突然变短")
                 with gr.Row(): mark_ok_button = gr.Button("当前帧没有问题"); mark_repair_button = gr.Button("把当前帧送去修补")
-                with gr.Accordion("对齐辅助：固定锚点与首帧叠影", open=False):
-                    gr.Markdown("青色竖线是固定水平锚点，红线是脚底/角色根部基线，黄色圆圈标出交点。每帧人物应围绕同一锚点运动；姿势可以改变，但整个人物不能在画布里平移。")
+                with gr.Accordion("位置连续性辅助：参考线与相邻帧叠影", open=False):
+                    gr.Markdown("十字线只是项目放置参考，不要求每帧人物都严格压在交点上。相邻帧叠影中，紫红色是前一帧、青色是当前帧；连续的小幅位移是正常的，突然分离很远才是问题。工具不会裁剪、缩放或重新居中任何一帧。")
                     with gr.Row():
-                        baseline_preview = gr.Image(initial_review[11], label="固定锚点十字线", type="filepath", interactive=False, elem_classes=["pixel-preview"])
-                        overlay_preview = gr.Image(initial_review[10], label="首帧叠影", type="filepath", interactive=False, elem_classes=["pixel-preview"])
+                        baseline_preview = gr.Image(initial_review[11], label="项目参考线（不强制居中）", type="filepath", interactive=False, elem_classes=["pixel-preview"])
+                        overlay_preview = gr.Image(initial_review[10], label="相邻帧叠影", type="filepath", interactive=False, elem_classes=["pixel-preview"])
                 acknowledge = gr.Checkbox(value=bool(initial_review[8].get("value", False)), label="我已查看自动提醒，仍决定采用", visible=bool(initial_review[8].get("visible", False)))
                 with gr.Row():
                     approve_button = gr.Button("这组动画可以使用", variant="primary", interactive=bool(initial_review[9].get("interactive", False)))
@@ -795,12 +847,19 @@ def build_ui(root: str | Path | None = None) -> Any:
                 with gr.Row(): save_api_button = gr.Button("保存并立即生效", variant="primary"); clear_api_button = gr.Button("清除已保存的 Key")
                 gr.HTML(
                     '<div class="section-intro"><h2>游戏项目</h2>'
-                    f'<p>当前配置决定单帧尺寸、Sheet 排列、动作名称和推荐文件名。项目：{_escape(profile.project_name)}；引擎：{_escape(profile.engine)}；目标角色：{_escape(profile.character_name)}。</p>'
-                    f'<div class="contract-grid"><div class="contract-card"><small>单帧</small><b>{profile.cell_width}×{profile.cell_height} RGBA</b></div><div class="contract-card"><small>排列</small><b>{profile.columns} 列，按行读取</b></div><div class="contract-card"><small>锚点 / 运行时偏移</small><b>({profile.anchor_x},{profile.anchor_ground_y}) / ({profile.sprite_offset_x},{profile.sprite_offset_y})</b></div></div></div>'
-                    + '<table class="project-table"><thead><tr><th>动画</th><th>帧数</th><th>播放</th><th>推荐文件名</th></tr></thead><tbody>'
-                    + "".join(f"<tr><td>{_escape(item.display_name)}</td><td>{item.frame_count}</td><td>{item.fps:g} FPS · {'循环' if item.loop else '单次'}</td><td>{_escape(item.filename)}</td></tr>" for item in profile.actions)
+                    f'<p>这里展示的是资产清单中的项目合同，不是模型默认值。项目：{_escape(profile.project_name)}；引擎：{_escape(profile.engine)}；目标角色：{_escape(profile.character_name)}。</p>'
+                    f'<div class="contract-grid"><div class="contract-card"><small>单帧</small><b>{profile.cell_width}×{profile.cell_height} RGBA</b></div><div class="contract-card"><small>网格</small><b>每行 {profile.columns} 格；高度和播放格位按动作</b></div><div class="contract-card"><small>参考锚点 / 运行时偏移</small><b>({profile.anchor_x},{profile.anchor_ground_y}) / ({profile.sprite_offset_x},{profile.sprite_offset_y})</b></div></div></div>'
+                    + '<table class="project-table"><thead><tr><th>动画</th><th>输出规格</th><th>播放</th><th>文件名</th><th>工程状态</th></tr></thead><tbody>'
+                    + "".join(
+                        f"<tr><td>{_escape(item.display_name)}</td>"
+                        f"<td>{item.sheet_size[0]}×{item.sheet_size[1]} · {item.frame_count} 帧{' · 稀疏格位' if item.is_sparse else ''}</td>"
+                        f"<td>{item.fps:g} FPS{'（资源场景 ' + format(item.scene_fps, 'g') + '）' if item.scene_fps != item.fps else ''} · {'循环' if item.loop else '单次'}</td>"
+                        f"<td>{_escape(item.filename)}</td>"
+                        f"<td>{'现有资产合同' if item.integration_status == 'existing' else '新增，待 Godot 接线'}</td></tr>"
+                        for item in profile.actions
+                    )
                     + '</tbody></table>'
-                    + _notice("warn", "地面攻击和空中攻击暂不开放直接替换", "当前 Godot 场景使用稀疏格坐标选出 5 帧，不能把 5 个连续格简单覆盖回原文件。首版先安全支持待机、行走、跳跃、受击和失败。")
+                    + _notice("info", "攻击动作已按项目格位适配", "地面攻击和空中攻击会导出 5 个播放帧及项目要求的透明空格；向后闪避是新增资产，导出后仍需在 Godot 状态机中接线。")
                 )
 
         review_outputs = [review_candidate, animation_preview, frame_gallery, review_summary, review_issues, review_details, selected_frame_index, selected_frame_banner, acknowledge, approve_button, overlay_preview, baseline_preview, review_candidate_group]

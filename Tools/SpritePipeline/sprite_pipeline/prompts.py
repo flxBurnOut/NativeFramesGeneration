@@ -19,14 +19,26 @@ def compose_generation_prompt(character: CharacterPreset, action: ActionPreset) 
         "Animation action:",
         action.action_description.strip(),
         "",
-        f"Produce exactly {action.frame_count} ordered animation frames on the unchanged "
+        f"Produce exactly {action.generation_frame_count} ordered animation frames on the unchanged "
         f"{character.cell_width}x{character.cell_height} canvas.",
     ]
+    if action.generation_frame_count != action.frame_count:
+        retained = ", ".join(str(index + 1) for index in action.generation_frame_selection)
+        parts.extend(
+            [
+                "",
+                f"Keep all source frames continuous. The harness retains frames {retained} "
+                f"as the project's {action.frame_count}-frame sequence.",
+            ]
+        )
     constraints = list(action.locked_constraints)
     required = [
         f"fixed side-view; face {character.facing}",
         "exact canvas and identity",
-        f"root locked at ({character.anchor.x},{character.anchor.ground_y}) every frame; no whole-sprite canvas shift",
+        (
+            f"start near root reference ({character.anchor.x},{character.anchor.ground_y}); "
+            "smooth frame-to-frame root path; no sudden whole-sprite jump"
+        ),
     ]
     if character.transparent_background:
         required.append("keep a fully transparent background")

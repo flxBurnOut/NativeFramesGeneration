@@ -49,7 +49,7 @@ from .settings import HarnessSettings
 from .store import JobStore
 
 
-QA_ALGORITHM_VERSION = "sprite-pipeline-qa-v1"
+QA_ALGORITHM_VERSION = "sprite-pipeline-qa-v2"
 
 
 class SpritePipelineService:
@@ -313,6 +313,20 @@ class SpritePipelineService:
         updates: dict[str, Any] = {}
         if request.frame_count is not None:
             updates["frame_count"] = request.frame_count
+            if request.frame_count != base_action.frame_count:
+                # A caller override describes a custom regular sequence. Do not
+                # silently reuse a project-specific provider reduction or sparse
+                # sheet layout that was authored for a different frame count.
+                updates.update(
+                    {
+                        "provider_frame_count": None,
+                        "provider_frame_selection": [],
+                        "sheet_columns": None,
+                        "sheet_rows": None,
+                        "sheet_frame_cells": [],
+                        "critical_frame_indices": [],
+                    }
+                )
         if request.action_description is not None:
             updates["action_description"] = request.action_description
         if request.loop is not None:
@@ -322,6 +336,17 @@ class SpritePipelineService:
             if not request.loop:
                 updates["loop_constraint"] = None
         action = ActionPreset.model_validate({**base_action.model_dump(), **updates})
+        if request.provider != "import":
+            provider_count = action.generation_frame_count
+            if provider_count < 4 or provider_count > 16 or provider_count % 2:
+                raise ValidationHarnessError(
+                    "model generation requires an even source frame count between 4 and 16",
+                    details={
+                        "project_frame_count": action.frame_count,
+                        "provider_frame_count": provider_count,
+                        "action_id": action.action_id,
+                    },
+                )
         full_prompt = compose_generation_prompt(character, action)
         if request.provider == "pixellab" and len(full_prompt) > 1000:
             raise ValidationHarnessError(
@@ -448,18 +473,38 @@ class SpritePipelineService:
                 output_dir.rmdir()
             staging_dir = Path(tempfile.mkdtemp(prefix=f".{candidate.candidate_id}.", dir=raw_root))
             try:
+                locked_columns = job.action.sheet_columns if sheet_kind else None
+                if locked_columns is not None and columns is not None and columns != locked_columns:
+                    raise ValidationHarnessError(
+                        "sheet columns differ from the selected action contract",
+                        details={"actual": columns, "expected": locked_columns},
+                    )
                 effective_columns = (
-                    columns if columns is not None else job.character.sheet_columns
+                    locked_columns or columns or job.character.sheet_columns
                 ) if sheet_kind else columns
+                frame_cells = job.action.frame_cells if sheet_kind and job.action.sheet_columns else []
+                if sheet_kind and job.action.sheet_rows is not None:
+                    expected_size = (
+                        job.character.cell_width * int(effective_columns),
+                        job.character.cell_height * job.action.sheet_rows,
+                    )
+                    with Image.open(source_path) as opened:
+                        opened.load()
+                        if opened.size != expected_size:
+                            raise ValidationHarnessError(
+                                "sheet dimensions differ from the selected action contract",
+                                details={"actual": list(opened.size), "expected": list(expected_size)},
+                            )
                 staged_paths = ingest_frames(
                     source_path,
                     staging_dir,
                     job.character.cell_width,
                     job.character.cell_height,
-                    None,
+                    len(frame_cells) if frame_cells else None,
                     source_kind=source_kind,
                     columns=effective_columns,
-                    auto_detect_sheet_count=sheet_kind,
+                    frame_cells=frame_cells or None,
+                    auto_detect_sheet_count=sheet_kind and not frame_cells,
                 )
                 staged_records = [
                     (index, path.name, sha256_file(path)) for index, path in enumerate(staged_paths)
@@ -606,7 +651,7 @@ class SpritePipelineService:
         request = ProviderRequest(
             reference_image=reference_bytes,
             prompt=snapshot.full_prompt,
-            frame_count=snapshot.action.frame_count,
+            frame_count=snapshot.action.generation_frame_count,
             seed=snapshot_candidate.seed,
             transparent_background=snapshot.character.transparent_background,
         )
@@ -627,7 +672,7 @@ class SpritePipelineService:
                 )
             candidate.status = CandidateStatus.submitting
             candidate.provider_name = provider.name
-            candidate.provider_model = "animate-with-text-v3" if provider.name == "pixellab" else "diagnostic-anchor-locked-v2"
+            candidate.provider_model = "animate-with-text-v3" if provider.name == "pixellab" else "diagnostic-continuity-v2"
             job.status = JobStatus.provider_pending
             job.touch("candidate_submitting", candidate_index=candidate_index, provider=provider.name)
         try:
@@ -779,24 +824,64 @@ class SpritePipelineService:
             candidate = self._candidate(job, candidate_index)
             if not self._is_current_poll_target(candidate, expected_provider_job_id):
                 return False
+            provider_frame_count = job.action.generation_frame_count
+            selection = job.action.generation_frame_selection
+            if len(images) != provider_frame_count:
+                raise ValidationHarnessError(
+                    "provider returned the wrong source frame count",
+                    details={"actual": len(images), "expected": provider_frame_count},
+                )
+            if len(selection) != job.action.frame_count:
+                raise ValidationHarnessError(
+                    "provider frame selection does not match the project action",
+                    details={"selection": selection, "project_frame_count": job.action.frame_count},
+                )
             output_dir = self.store.job_dir(job_id) / "raw" / candidate.candidate_id
             raw_root = output_dir.parent
             raw_root.mkdir(parents=True, exist_ok=True)
             staging_dir = Path(tempfile.mkdtemp(prefix=f".{candidate.candidate_id}.", dir=raw_root))
             frames: list[FrameRecord] = []
             manifest_frames: list[dict[str, Any]] = []
+            source_manifest_frames: list[dict[str, Any]] = []
+            staged_records: list[tuple[int, str, str]] = []
             try:
-                staged_records: list[tuple[int, str, str]] = []
-                for index, payload in enumerate(images):
-                    path = staging_dir / f"frame_{index:03d}.png"
+                source_dir = staging_dir / "provider_source"
+                source_dir.mkdir(parents=True, exist_ok=True)
+                source_alpha: dict[int, bool] = {}
+                for source_index, payload in enumerate(images):
+                    path = source_dir / f"source_frame_{source_index:03d}.png"
                     self._atomic_write_bytes(path, payload)
                     with Image.open(path) as opened:
                         opened.load()
+                        if opened.format != "PNG":
+                            raise ValidationHarnessError(
+                                "provider source frame is not PNG",
+                                details={"source_index": source_index, "format": opened.format},
+                            )
                         has_alpha = "A" in opened.getbands() or "transparency" in opened.info
+                    source_alpha[source_index] = has_alpha
+                    source_manifest_frames.append(
+                        {
+                            "source_index": source_index,
+                            "output_name": f"provider_source/{path.name}",
+                            "source_has_alpha": has_alpha,
+                            "sha256": sha256_file(path),
+                        }
+                    )
+
+                for index, source_index in enumerate(selection):
+                    path = staging_dir / f"frame_{index:03d}.png"
+                    self._atomic_write_bytes(path, images[source_index])
                     digest = sha256_file(path)
                     staged_records.append((index, path.name, digest))
                     manifest_frames.append(
-                        {"index": index, "output_name": path.name, "source_has_alpha": has_alpha}
+                        {
+                            "index": index,
+                            "output_name": path.name,
+                            "provider_source_index": source_index,
+                            "source_has_alpha": source_alpha[source_index],
+                            "sha256": digest,
+                        }
                     )
                 atomic_write_json(
                     staging_dir / "frames_manifest.json",
@@ -804,20 +889,25 @@ class SpritePipelineService:
                         "schema_version": 1,
                         "source_kind": "provider",
                         "diagnostic_only": diagnostic_only,
+                        "provider_frame_count": provider_frame_count,
+                        "project_frame_count": job.action.frame_count,
+                        "provider_frame_selection": selection,
+                        "provider_source_frames": source_manifest_frames,
                         "frames": manifest_frames,
                     },
                 )
                 if output_dir.exists() and any(output_dir.iterdir()):
-                    existing = sorted(output_dir.glob("frame_*.png"))
-                    existing_digests = [sha256_file(path) for path in existing]
-                    staged_digests = [digest for _index, _filename, digest in staged_records]
-                    existing_manifest = output_dir / "frames_manifest.json"
-                    staged_manifest = staging_dir / "frames_manifest.json"
-                    manifests_match = (
-                        existing_manifest.is_file()
-                        and sha256_file(existing_manifest) == sha256_file(staged_manifest)
-                    )
-                    if existing_digests != staged_digests or not manifests_match:
+                    existing_fingerprints = [
+                        (path.relative_to(output_dir).as_posix(), sha256_file(path))
+                        for path in sorted(output_dir.rglob("*"))
+                        if path.is_file()
+                    ]
+                    staged_fingerprints = [
+                        (path.relative_to(staging_dir).as_posix(), sha256_file(path))
+                        for path in sorted(staging_dir.rglob("*"))
+                        if path.is_file()
+                    ]
+                    if existing_fingerprints != staged_fingerprints:
                         raise ConflictError(
                             "provider raw frame directory contains different immutable files",
                             details={"candidate_index": candidate_index},
@@ -850,6 +940,8 @@ class SpritePipelineService:
                 "provider_frames_saved",
                 candidate_index=candidate_index,
                 frame_count=len(frames),
+                provider_frame_count=provider_frame_count,
+                provider_frame_selection=selection,
                 diagnostic_only=diagnostic_only,
             )
             return True
@@ -943,10 +1035,19 @@ class SpritePipelineService:
         self._apply_qa_report(candidate, report)
         preview_dir = self.store.job_dir(job_id) / "previews"
         prefix = preview_dir / candidate.candidate_id
+        sheet_columns = job.action.sheet_columns or job.character.sheet_columns
+        sheet_rows = job.action.sheet_rows
+        sheet_cells = job.action.frame_cells or None
         preview_builders = (
             (
                 "sheet",
-                lambda: build_sprite_sheet(frame_paths, prefix.with_suffix(".sheet.png"), job.character.sheet_columns),
+                lambda: build_sprite_sheet(
+                    frame_paths,
+                    prefix.with_suffix(".sheet.png"),
+                    sheet_columns,
+                    rows=sheet_rows,
+                    frame_cells=sheet_cells,
+                ),
             ),
             (
                 "gif",
@@ -1024,7 +1125,11 @@ class SpritePipelineService:
         return {
             "duplicate_min_run": qa.duplicate_run_length,
             "area_change_ratio": qa.area_change_ratio,
-            "centroid_jump_pixels": qa.centroid_shift_px,
+            "centroid_jump_pixels": (
+                job.action.centroid_shift_px
+                if job.action.centroid_shift_px is not None
+                else qa.centroid_shift_px
+            ),
             "palette_deviation_ratio": qa.palette_mismatch_ratio,
             "palette_color_distance": qa.palette_distance,
             "loop_difference_ratio": qa.loop_difference_ratio,
@@ -1255,7 +1360,15 @@ class SpritePipelineService:
         with self.store.locked_job(job_id) as job:
             candidate = self._candidate(job, candidate_index)
             self._assert_exportable(job_id, job, candidate)
-            columns = options.columns or job.character.sheet_columns
+            locked_columns = job.action.sheet_columns
+            if locked_columns is not None and options.columns is not None and options.columns != locked_columns:
+                raise ConflictError(
+                    "export columns are locked by the selected project action",
+                    details={"actual": options.columns, "expected": locked_columns},
+                )
+            columns = locked_columns or options.columns or job.character.sheet_columns
+            rows = job.action.sheet_rows
+            frame_cells = job.action.frame_cells or None
             export_dir = self.settings.exports_dir / job.character.character_id / job.action.action_id
             export_dir.mkdir(parents=True, exist_ok=True)
             stem = Path(options.filename).stem if options.filename else f"{job.character.character_id}_{job.action.action_id}"
@@ -1279,7 +1392,13 @@ class SpritePipelineService:
             frame_paths = self._snapshot_verified_frames(job_id, job, candidate, snapshot_dir)
             from .processing import build_gif, build_sprite_sheet
 
-            sheet_meta = build_sprite_sheet(frame_paths, staged_sheet, columns)
+            sheet_meta = build_sprite_sheet(
+                frame_paths,
+                staged_sheet,
+                columns,
+                rows=rows,
+                frame_cells=frame_cells,
+            )
             build_gif(frame_paths, staged_preview, job.action.fps, scale=1, loop=job.action.loop)
             recipe = {
                 "schema_version": 1,
@@ -1290,15 +1409,31 @@ class SpritePipelineService:
                 "diagnostic_only": candidate.diagnostic_only,
                 "character_id": job.character.character_id,
                 "action_id": job.action.action_id,
+                "manifest_action_name": job.action.manifest_action_name,
                 "cell_width": job.character.cell_width,
                 "cell_height": job.character.cell_height,
                 "columns": columns,
+                "rows": sheet_meta["rows"],
                 "sheet_width": sheet_meta["sheet_width"],
                 "sheet_height": sheet_meta["sheet_height"],
                 "frame_count": len(frame_paths),
                 "frame_order": [frame.index for frame in candidate.frames],
+                "frame_cells": sheet_meta["frame_cells"],
+                "unused_cells": sheet_meta["unused_cells"],
+                "source_region_px": [
+                    [
+                        int(column) * job.character.cell_width,
+                        int(row) * job.character.cell_height,
+                        job.character.cell_width,
+                        job.character.cell_height,
+                    ]
+                    for column, row in sheet_meta["frame_cells"]
+                ],
                 "fps": job.action.fps,
+                "runtime_fps": job.action.fps,
+                "scene_fps": job.action.scene_fps or job.action.fps,
                 "loop": job.action.loop,
+                "critical_frame_indices": job.action.critical_frame_indices,
                 "alpha": True,
                 "qa_input_sha256": candidate.qa_input_sha256,
                 "source_frames": [

@@ -4,8 +4,13 @@
   "display_name": "倒地死亡",
   "frame_count": 16,
   "fps": 12,
+  "scene_fps": 12,
   "loop": false,
   "grounded": true,
+  "manifest_action_name": "defeated",
+  "sheet_columns": 4,
+  "sheet_rows": 4,
+  "centroid_shift_px": 4,
   "action_description": "A 16-frame non-looping defeat. Keep frame 1 unchanged; frames 2-5 stagger, 6-12 collapse, and frames 13-16 settle into a readable defeated pose with no recovery.",
   "locked_constraints": [
     "keep the final body visible and on the original ground line",

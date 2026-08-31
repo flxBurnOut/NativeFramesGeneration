@@ -29,7 +29,7 @@ DEFAULT_QA_THRESHOLDS: dict[str, int | float | None] = {
     "loop_difference_ratio": 0.25,
     "ground_y": None,
     "ground_baseline_tolerance": 4,
-    "rigid_translation_tolerance_px": 0,
+    "rigid_translation_tolerance_px": 4,
     "duplicate_min_run": 2,
 }
 
@@ -50,10 +50,10 @@ def run_frame_qa(
 
     Hard failures block export: missing/wrong count, corrupt files, unexpected
     dimensions, blank frames, missing source alpha, exact consecutive duplicate
-    runs, and whole-sprite canvas translations. Warnings cover canvas-edge
-    contact, safe-margin violations, area change from a reference, adjacent
-    centroid jumps, palette deviation, loop end/start difference, and grounded
-    baseline drift.
+    runs, and high-confidence sudden whole-sprite position jumps. Warnings cover
+    canvas-edge contact, safe-margin violations, area change from a reference,
+    adjacent centroid displacement/velocity jumps, palette deviation, loop
+    end/start difference, and grounded baseline drift.
 
     ``thresholds`` accepts the keys in :data:`DEFAULT_QA_THRESHOLDS`:
 
@@ -68,8 +68,10 @@ def run_frame_qa(
     - ``loop_difference_ratio``: maximum exact RGBA pixel mismatch fraction.
     - ``ground_y`` and ``ground_baseline_tolerance``: expected inclusive bottom
       row and allowed pixel delta. ``ground_y`` defaults to the reference.
-    - ``rigid_translation_tolerance_px``: allowed exact whole-sprite translation
-      between adjacent frames before export is blocked.
+    - ``rigid_translation_tolerance_px``: allowed change in exact whole-sprite
+      velocity between adjacent frame pairs. A one-step displacement above twice
+      this value is also treated as a sudden jump. Continuous root motion is
+      allowed; per-frame centering is never performed.
     - ``duplicate_min_run``: minimum identical consecutive run length (>=2).
 
     Imported frame directories automatically consume ``frames_manifest.json``
@@ -213,8 +215,10 @@ def run_frame_qa(
         for index in run:
             frame_reports[index]["hard_failures"].append("consecutive_duplicate_frames")
 
-    rigid_translations: list[dict[str, int]] = []
+    rigid_translations: list[dict[str, int | None]] = []
+    position_jumps: list[dict[str, int | None]] = []
     translation_tolerance = int(effective["rigid_translation_tolerance_px"] or 0)
+    absolute_translation_limit = max(1, translation_tolerance * 2)
     for previous_index, current_index in zip(
         range(len(frame_reports) - 1), range(1, len(frame_reports))
     ):
@@ -233,32 +237,61 @@ def run_frame_qa(
         if (
             int(current_bbox[2]) - int(previous_bbox[2]) != dx
             or int(current_bbox[3]) - int(previous_bbox[3]) != dy
-            or max(abs(dx), abs(dy)) <= translation_tolerance
         ):
             continue
         translated = Image.new("RGBA", previous_image.size, (0, 0, 0, 0))
         translated.paste(previous_image, (dx, dy))
         if translated.tobytes() != current_image.tobytes():
             continue
-        translation = {
+        previous_translation = (
+            rigid_translations[-1]
+            if rigid_translations and rigid_translations[-1]["to"] == previous_index
+            else None
+        )
+        velocity_change = (
+            max(
+                abs(dx - int(previous_translation["dx"] or 0)),
+                abs(dy - int(previous_translation["dy"] or 0)),
+            )
+            if previous_translation is not None
+            else None
+        )
+        step_distance = max(abs(dx), abs(dy))
+        translation: dict[str, int | None] = {
             "from": previous_index,
             "to": current_index,
             "dx": dx,
             "dy": dy,
+            "step_distance": step_distance,
+            "velocity_change": velocity_change,
         }
         rigid_translations.append(translation)
+        is_abrupt = step_distance > absolute_translation_limit or (
+            velocity_change is not None and velocity_change > translation_tolerance
+        )
+        if not is_abrupt:
+            continue
+        jump = {
+            **translation,
+            "velocity_change_limit": translation_tolerance,
+            "absolute_step_limit": absolute_translation_limit,
+        }
+        position_jumps.append(jump)
         _add_hard_failure(
             hard_failures,
             frame_reports[current_index],
-            "frame_anchor_translation",
+            "frame_position_jump",
             (
-                f"Frame {current_index} is frame {previous_index} translated by "
-                f"({dx},{dy})px inside the canvas."
+                f"Frame {current_index} suddenly jumps relative to frame "
+                f"{previous_index}: exact translation ({dx},{dy})px."
             ),
             previous_frame=previous_index,
             dx=dx,
             dy=dy,
-            threshold=translation_tolerance,
+            step_distance=step_distance,
+            velocity_change=velocity_change,
+            velocity_change_limit=translation_tolerance,
+            absolute_step_limit=absolute_translation_limit,
         )
 
     reference_metrics, reference_error = _load_reference_metrics(
@@ -309,6 +342,8 @@ def run_frame_qa(
         pair_metric = {
             "from": previous_index,
             "to": current_index,
+            "dx": round(float(current_centroid[0]) - float(previous_centroid[0]), 6),
+            "dy": round(float(current_centroid[1]) - float(previous_centroid[1]), 6),
             "distance_pixels": round(distance, 6),
             "distance_ratio": round(ratio, 6),
         }
@@ -325,6 +360,48 @@ def run_frame_qa(
                 previous_frame=previous_index,
                 distance_pixels=round(distance, 6),
                 distance_ratio=round(ratio, 6),
+                threshold=threshold_value,
+                threshold_kind=threshold_kind,
+            )
+
+    centroid_velocity_changes: list[dict[str, object]] = []
+    for previous_pair, current_pair in zip(centroid_pairs, centroid_pairs[1:]):
+        if previous_pair["to"] != current_pair["from"]:
+            continue
+        velocity_change = math.hypot(
+            float(current_pair["dx"]) - float(previous_pair["dx"]),
+            float(current_pair["dy"]) - float(previous_pair["dy"]),
+        )
+        middle_index = int(current_pair["from"])
+        end_index = int(current_pair["to"])
+        width = int(frame_reports[end_index].get("width", 0))
+        height = int(frame_reports[end_index].get("height", 0))
+        diagonal = math.hypot(width, height) or 1.0
+        change_ratio = velocity_change / diagonal
+        metric = {
+            "at": middle_index,
+            "to": end_index,
+            "velocity_change_pixels": round(velocity_change, 6),
+            "velocity_change_ratio": round(change_ratio, 6),
+        }
+        centroid_velocity_changes.append(metric)
+        exceeded = (
+            velocity_change > float(pixel_limit)
+            if pixel_limit is not None
+            else change_ratio > ratio_limit
+        )
+        if exceeded:
+            threshold_value = float(pixel_limit) if pixel_limit is not None else ratio_limit
+            threshold_kind = "pixels" if pixel_limit is not None else "ratio"
+            _add_warning(
+                warnings,
+                frame_reports[end_index],
+                "centroid_velocity_jump",
+                f"Position trajectory changes abruptly around frame {middle_index}.",
+                previous_frame=int(previous_pair["from"]),
+                middle_frame=middle_index,
+                velocity_change_pixels=round(velocity_change, 6),
+                velocity_change_ratio=round(change_ratio, 6),
                 threshold=threshold_value,
                 threshold_kind=threshold_kind,
             )
@@ -448,7 +525,9 @@ def run_frame_qa(
         "sequence_metrics": {
             "duplicate_runs": duplicate_runs,
             "rigid_translations": rigid_translations,
+            "position_jumps": position_jumps,
             "centroid_pairs": centroid_pairs,
+            "centroid_velocity_changes": centroid_velocity_changes,
             "palette_color_count": len(palette_colors),
             "loop": loop_metric,
             "ground_y": ground_reference,

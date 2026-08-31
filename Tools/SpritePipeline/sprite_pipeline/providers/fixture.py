@@ -1,9 +1,10 @@
 """Deterministic offline fixture provider for harness diagnostics.
 
-The fixture provider never calls a model or network service.  It keeps the
-validated reference at one exact canvas anchor and varies only a few existing
-interior colour pixels to simulate a tiny status-light pulse.  Its output is
-intentionally marked
+The fixture provider never calls a model or network service.  Because its
+bundled action is idle, it keeps the validated reference at one canvas position
+and varies only a few existing interior colour pixels to simulate a tiny
+status-light pulse.  This is an idle-demo choice, not a universal fixed-centre
+rule.  Its output is intentionally marked
 ``diagnostic_only`` everywhere: it verifies orchestration, storage, QA, review,
 and export plumbing, but it is not a generated production animation.
 """
@@ -46,7 +47,7 @@ class _FixtureJob:
 
 
 class FixtureProvider(SpriteProvider):
-    """Offline provider that returns deterministic anchor-locked frames.
+    """Offline provider that returns deterministic stable-position idle frames.
 
     The provider is suitable for CI, demonstrations, and Codex-driven smoke
     tests without a PixelLab token.  It must never be represented as an AI
@@ -123,7 +124,7 @@ class FixtureProvider(SpriteProvider):
 
         request_record = {
             "provider": self.name,
-            "operation": "deterministic_anchor_locked_pulse",
+            "operation": "deterministic_idle_continuity_pulse",
             "diagnostic_only": True,
             "reference_frame": {
                 "format": "png",
@@ -141,7 +142,7 @@ class FixtureProvider(SpriteProvider):
             "provider_job_id": job_id,
             "status": "completed",
             "diagnostic_only": True,
-            "note": "fixture frames keep one fixed anchor and pulse interior pixels; they are not model-generated art",
+            "note": "idle fixture frames hold position and pulse interior pixels; other actions may move continuously",
         }
         return Submission(
             provider=self.name,
@@ -184,7 +185,7 @@ class FixtureProvider(SpriteProvider):
             "offsets": [{"x": x, "y": y} for x, y in offsets],
             "diagnostic_only": True,
             "reference_sha256": job.reference_sha256,
-            "note": "fixture frames keep one fixed anchor and pulse interior pixels; they are not model-generated art",
+            "note": "idle fixture frames hold position and pulse interior pixels; other actions may move continuously",
         }
         return PollResult(
             provider=self.name,
