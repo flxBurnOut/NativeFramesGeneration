@@ -175,7 +175,7 @@ class GenerationRequest(StrictModel):
     character_id: str
     action_id: str
     provider: Literal["pixellab", "fixture", "import"] = "pixellab"
-    candidate_count: int = Field(default=3, ge=1, le=8)
+    candidate_count: int = Field(default=1, ge=1, le=8)
     seed: int | None = Field(default=None, ge=0, le=2**31 - 1)
     frame_count: int | None = Field(default=None, ge=1, le=64)
     action_description: str | None = Field(default=None, max_length=1000)

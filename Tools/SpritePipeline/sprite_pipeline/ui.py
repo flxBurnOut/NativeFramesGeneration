@@ -42,6 +42,7 @@ QA_CODE_CN = {
     "loop_endpoint_difference": "循环首尾差异较大", "ground_baseline_drift": "脚底位置发生跳动", "reference_unavailable": "参考图检查被跳过",
     "frame_position_jump": "整个人物在相邻帧之间发生突变式跳位",
     "centroid_velocity_jump": "相邻帧的位置运动趋势发生突变",
+    "provider_frame_count_adjusted": "模型返回的帧数与预设不同；已保留全部有效帧并自动补透明空格",
     "palette_unavailable": "色板检查被跳过", "preview_generation_failed": "预览图生成失败",
 }
 ISSUE_TYPE_CHOICES = [
@@ -322,7 +323,14 @@ def build_ui(root: str | Path | None = None) -> Any:
                 continue
             if repair_only and not any(frame.review_status.value == "repair_requested" for frame in candidate.frames):
                 continue
-            result.append((f"生成结果 {_candidate_letter(candidate.candidate_index)} · {CANDIDATE_STATUS_CN.get(candidate.status.value, candidate.status.value)}", candidate.candidate_index))
+            recoverable = (
+                candidate.status.value == "failed"
+                and candidate.provider_status == "completed"
+                and bool(candidate.provider_job_id)
+                and not candidate.frames
+            )
+            recovery_label = " · 可取回已完成结果" if recoverable else ""
+            result.append((f"生成结果 {_candidate_letter(candidate.candidate_index)} · {CANDIDATE_STATUS_CN.get(candidate.status.value, candidate.status.value)}{recovery_label}", candidate.candidate_index))
         return result
 
     def default_candidate(job: Any, *, approved_only: bool = False, repair_only: bool = False) -> int | None:
@@ -546,6 +554,52 @@ def build_ui(root: str | Path | None = None) -> Any:
         selected = current if current in values else choices[0][1] if choices else None
         return gr.update(choices=choices, value=selected), *review_payload(selected)
 
+    def recover_provider_result(
+        job_id: str | None,
+        candidate_index: int | None,
+    ) -> tuple[Any, ...]:
+        try:
+            if not api_configured():
+                raise ValidationHarnessError("PixelLab API key is not configured")
+            if not job_id:
+                raise ValidationHarnessError("请先选择要取回的任务")
+            job = service.get_job(str(job_id))
+            selected = int(candidate_index) if candidate_index else None
+            if selected is None:
+                selected = next(
+                    (
+                        item.candidate_index
+                        for item in job.candidates
+                        if item.status.value == "failed"
+                        and item.provider_status == "completed"
+                        and item.provider_job_id
+                        and not item.frames
+                    ),
+                    None,
+                )
+            if selected is None:
+                raise ValidationHarnessError("所选任务没有可取回的已完成结果")
+            job = service.recover_completed_candidate(job.job_id, selected)
+            candidate = next(item for item in job.candidates if item.candidate_index == selected)
+            pending = candidate.status.value == "provider_pending"
+            return (
+                _notice(
+                    "info" if pending else "ok",
+                    "正在读取已有结果" if pending else "已取回已有结果",
+                    "没有创建新的生成任务；请稍后再点一次此按钮。"
+                    if pending
+                    else f"没有创建新的生成任务；已保留 {len(candidate.frames)} 个有效帧。",
+                ),
+                review_job_update(job.job_id),
+                *review_payload(job.job_id, selected),
+            )
+        except Exception as exc:
+            return (
+                _notice("error", "已有结果没有取回", _human_error(exc)),
+                review_job_update(job_id),
+                *review_payload(job_id, candidate_index),
+            )
+
     def select_frame(job_id: str | None, candidate_index: int | None, evt: gr.SelectData) -> tuple[int, str]:
         try:
             raw_index, raw_value = getattr(evt, "index", 0), getattr(evt, "value", None)
@@ -657,9 +711,13 @@ def build_ui(root: str | Path | None = None) -> Any:
                 return empty
             candidate = next(item for item in job.candidates if item.candidate_index == selected)
             columns = job.action.sheet_columns or job.character.sheet_columns
-            rows = job.action.sheet_rows or math.ceil(len(candidate.frames) / columns)
+            if len(candidate.frames) == job.action.frame_count:
+                rows = job.action.sheet_rows or math.ceil(len(candidate.frames) / columns)
+                frame_cells = job.action.frame_cells
+            else:
+                rows = max(job.action.sheet_rows or 0, math.ceil(len(candidate.frames) / columns))
+                frame_cells = []
             width, height = job.character.cell_width * columns, job.character.cell_height * rows
-            frame_cells = job.action.frame_cells
             regular_cells = [(index % columns, index // columns) for index in range(len(candidate.frames))]
             order_text = (
                 "按项目指定格位读取（透明空格不参与播放）"
@@ -671,10 +729,16 @@ def build_ui(root: str | Path | None = None) -> Any:
                 filename = action.filename if job.character.character_id == profile.character_id else f"{job.character.character_id}_{job.action.action_id}.png"
             except KeyError:
                 filename = f"{job.character.character_id}_{job.action.action_id}.png"
+            unused_count = columns * rows - len(candidate.frames)
+            count_note = (
+                f"实际采用 {len(candidate.frames)} 帧；末尾 {unused_count} 个格子保持透明。"
+                if unused_count
+                else f"实际采用 {len(candidate.frames)} 帧；没有空格。"
+            )
             summary = (
                 '<div class="section-intro"><h3>最终 Sprite Sheet</h3>'
                 f"<p>输出尺寸：{width}×{height}；单帧：{job.character.cell_width}×{job.character.cell_height}；"
-                f"排列：{columns} 列×{rows} 行；顺序：{order_text}；背景：透明 RGBA。</p>"
+                f"排列：{columns} 列×{rows} 行；顺序：{order_text}；背景：透明 RGBA。{count_note}</p>"
                 '<div class="notice info"><strong>关于位置对齐</strong>每帧保留完整画布，不会紧贴角色裁切，也不会逐帧自动居中。导出会保持你在检查页确认过的坐标。</div></div>'
             )
             prefix = service.store.job_dir(job.job_id) / "previews" / candidate.candidate_id
@@ -759,7 +823,8 @@ def build_ui(root: str | Path | None = None) -> Any:
                         generate_action = gr.Dropdown(actions, value=initial_action, label="要生成的动作", filterable=False, elem_classes=["static-choice"])
                         generate_action_summary = gr.HTML(action_projection(initial_action))
                         action_description = gr.Textbox(label="本次动作提示词（可选）", placeholder="例如：起步慢、第三帧开始加速、武器始终朝前；留空使用项目动作规格", lines=4)
-                        candidate_count = gr.Slider(1, 5, value=3, step=1, label="生成几个候选？")
+                        candidate_count = gr.Slider(1, 5, value=1, step=1, label="生成几个候选？（每个候选都会单独消耗一次 API 生成）")
+                        gr.Markdown("为节省试用次数，默认只生成 **1 个候选**；确认流程和提示词后再按需增加。")
                         with gr.Accordion("复现与调试设置", open=False):
                             seed = gr.Textbox(label="Seed（可选）", placeholder="留空则自动生成并记录")
                 generate_button = gr.Button("开始生成候选", variant="primary", interactive=api_configured(), elem_classes=["primary-action"])
@@ -785,6 +850,8 @@ def build_ui(root: str | Path | None = None) -> Any:
                 with gr.Row():
                     review_job = gr.Dropdown(initial_jobs, value=initial_job, label="选择要检查的动画", filterable=False, elem_classes=["static-choice"], scale=5)
                     refresh_review_button = gr.Button("刷新", scale=1)
+                    recover_result_button = gr.Button("取回所选旧结果（不重新生成）", scale=2)
+                recovery_status = gr.HTML()
                 with gr.Group(visible=bool(initial_review[12].get("visible", False))) as review_candidate_group:
                     review_candidate = gr.Radio(initial_review[0].get("choices", []), value=initial_review[0].get("value"), label="选择 AI 生成结果", elem_classes=["choice-cards"])
                 review_summary = gr.HTML(initial_review[3])
@@ -899,6 +966,11 @@ def build_ui(root: str | Path | None = None) -> Any:
         import_button.click(import_sheet, inputs=[import_file, import_action, import_state], outputs=[import_status, import_details, review_job, *review_outputs])
 
         refresh_review_button.click(refresh_review, inputs=review_job, outputs=[review_job, *review_outputs], queue=False)
+        recover_result_button.click(
+            recover_provider_result,
+            inputs=[review_job, review_candidate],
+            outputs=[recovery_status, review_job, *review_outputs],
+        )
         review_job.input(review_payload, inputs=review_job, outputs=review_outputs, queue=False)
         review_candidate.input(review_payload, inputs=[review_job, review_candidate], outputs=review_outputs, queue=False)
         frame_gallery.select(select_frame, inputs=[review_job, review_candidate], outputs=[selected_frame_index, selected_frame_banner], queue=False)

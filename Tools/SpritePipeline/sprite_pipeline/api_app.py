@@ -30,7 +30,7 @@ class GenerateBody(_Body):
 
 
 class FramesBody(_Body):
-    frames: list[str] = Field(min_length=1, max_length=16)
+    frames: list[str] = Field(min_length=1, max_length=64)
 
 
 class ApproveBody(_Body):
@@ -144,6 +144,11 @@ def create_api(root: str | Path | None = None) -> Any:
     @app.post("/v1/jobs/{job_id}/generate")
     def generate(job_id: str, body: GenerateBody) -> dict[str, Any]:
         job = service.generate_job(job_id, wait=body.wait, candidate_index=body.candidate_index)
+        return {"schema_version": 1, "ok": True, "data": {"job": _job(job)}}
+
+    @app.post("/v1/jobs/{job_id}/candidates/{candidate_index}/recover")
+    def recover(job_id: str, candidate_index: int) -> dict[str, Any]:
+        job = service.recover_completed_candidate(job_id, candidate_index)
         return {"schema_version": 1, "ok": True, "data": {"job": _job(job)}}
 
     @app.post("/v1/jobs/{job_id}/candidates/{candidate_index}/frames")

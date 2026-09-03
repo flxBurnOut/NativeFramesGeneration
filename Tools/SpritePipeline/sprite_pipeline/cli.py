@@ -46,7 +46,7 @@ def _parser() -> argparse.ArgumentParser:
     create.add_argument("--character")
     create.add_argument("--action")
     create.add_argument("--provider", choices=("pixellab", "fixture", "import"), default="pixellab")
-    create.add_argument("--candidates", type=int, default=3)
+    create.add_argument("--candidates", type=int, default=1)
     create.add_argument("--seed", type=int)
     create.add_argument("--frames", type=int)
     create.add_argument("--action-description")
@@ -56,6 +56,13 @@ def _parser() -> argparse.ArgumentParser:
     generate.add_argument("--job", required=True)
     generate.add_argument("--candidate", type=int)
     generate.add_argument("--no-wait", action="store_true", help="Advance one submit/poll step and return.")
+
+    recover = sub.add_parser(
+        "recover",
+        help="Poll an existing PixelLab candidate without submitting a new generation.",
+    )
+    recover.add_argument("--job", required=True)
+    recover.add_argument("--candidate", type=int, required=True)
 
     status = sub.add_parser("status", help="Return the complete durable job record.")
     status.add_argument("--job", required=True)
@@ -150,6 +157,9 @@ def _execute(args: argparse.Namespace) -> CommandResult | None:
         return CommandResult(operation=command, data={"job": _job_data(job)})
     if command == "generate":
         job = service.generate_job(args.job, wait=not args.no_wait, candidate_index=args.candidate)
+        return CommandResult(operation=command, data={"job": _job_data(job)})
+    if command == "recover":
+        job = service.recover_completed_candidate(args.job, args.candidate)
         return CommandResult(operation=command, data={"job": _job_data(job)})
     if command == "status":
         return CommandResult(operation=command, data={"job": _job_data(service.get_job(args.job))})

@@ -470,26 +470,24 @@ class PixelLabProvider(SpriteProvider):
 
         context = self._jobs.get(job_id)
         declared_count = last_response.get("frame_count")
-        if isinstance(declared_count, int) and declared_count != len(image_values):
-            return self._contract_failure(
-                job_id,
-                "completed",
-                raw_response,
-                usage,
-                "PixelLab frame_count disagrees with the number of returned images",
-                declared_frame_count=declared_count,
-                returned_images=len(image_values),
-            )
-        if context is not None and len(image_values) != context.expected_frame_count:
-            return self._contract_failure(
-                job_id,
-                "completed",
-                raw_response,
-                usage,
-                "PixelLab returned a different frame count than requested",
-                expected_frame_count=context.expected_frame_count,
-                returned_images=len(image_values),
-            )
+        returned_count = len(image_values)
+        requested_count = context.expected_frame_count if context is not None else None
+        if (
+            (isinstance(declared_count, int) and declared_count != returned_count)
+            or (requested_count is not None and requested_count != returned_count)
+        ):
+            # The image list is the usable result. Some successful PixelLab
+            # responses include an additional frame (commonly the submitted
+            # first frame) or omit/contradict frame_count. Preserve every
+            # validated image and leave the service layer to surface the count
+            # difference as a review warning instead of discarding paid work.
+            raw_response = dict(raw_response)
+            raw_response["harness_frame_count"] = {
+                "requested": requested_count,
+                "declared": declared_count if isinstance(declared_count, int) else None,
+                "returned": returned_count,
+                "policy": "preserve_all_returned_images",
+            }
 
         normalized_images: list[bytes] = []
         observed_size: tuple[int, int] | None = None

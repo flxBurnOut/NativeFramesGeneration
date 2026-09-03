@@ -9,6 +9,7 @@ import binascii
 import hashlib
 import io
 import json
+import math
 import re
 from pathlib import Path
 from typing import Any
@@ -633,6 +634,74 @@ class SpritePipelineService:
                 break
         return self.store.load(job_id)
 
+    def recover_completed_candidate(
+        self,
+        job_id: str,
+        candidate_index: int,
+    ) -> JobRecord:
+        """Poll an existing PixelLab job again without submitting a new generation."""
+
+        from .providers import get_provider
+
+        snapshot = self.store.load(job_id)
+        if snapshot.request.provider != "pixellab":
+            raise ValidationHarnessError(
+                "only PixelLab candidates can be recovered from an existing provider job"
+            )
+        candidate = self._candidate(snapshot, candidate_index)
+        if not candidate.provider_job_id:
+            raise ConflictError(
+                "candidate has no existing provider job to recover",
+                details={"candidate_index": candidate_index},
+            )
+        if candidate.frames:
+            raise ConflictError(
+                "candidate already contains usable frames",
+                details={"candidate_index": candidate_index},
+            )
+        recoverable_failure = (
+            candidate.status == CandidateStatus.failed
+            and candidate.provider_status == "completed"
+            and (candidate.error or {}).get("code")
+            in {"provider_contract_error", "provider_frame_storage_error", "validation_error"}
+        )
+        if candidate.status != CandidateStatus.provider_pending and not recoverable_failure:
+            raise ConflictError(
+                "candidate is not a recoverable completed or pending provider job",
+                details={
+                    "candidate_index": candidate_index,
+                    "status": candidate.status.value,
+                    "provider_status": candidate.provider_status,
+                    "error_code": (candidate.error or {}).get("code"),
+                },
+            )
+
+        provider = get_provider("pixellab", self.settings)
+        provider_job_id = candidate.provider_job_id
+        with self.store.locked_job(job_id) as job:
+            current = self._candidate(job, candidate_index)
+            if current.frames:
+                return job
+            if current.provider_job_id != provider_job_id:
+                raise ConflictError(
+                    "candidate provider job changed before recovery",
+                    details={"candidate_index": candidate_index},
+                )
+            current.status = CandidateStatus.provider_pending
+            current.error = None
+            self._refresh_job_status(job)
+            job.touch(
+                "candidate_recovery_started",
+                candidate_index=candidate_index,
+                provider_job_id=provider_job_id,
+                submission_created=False,
+            )
+
+        # This path deliberately calls only poll/GET. It never invokes
+        # provider.submit, so recovering paid output cannot create another job.
+        self._poll_candidate(job_id, candidate_index, provider, wait=False)
+        return self.store.load(job_id)
+
     def _submit_candidate(self, job_id: str, candidate_index: int, provider: Any) -> None:
         from .providers import ProviderRequest
 
@@ -824,14 +893,15 @@ class SpritePipelineService:
             candidate = self._candidate(job, candidate_index)
             if not self._is_current_poll_target(candidate, expected_provider_job_id):
                 return False
-            provider_frame_count = job.action.generation_frame_count
-            selection = job.action.generation_frame_selection
-            if len(images) != provider_frame_count:
-                raise ValidationHarnessError(
-                    "provider returned the wrong source frame count",
-                    details={"actual": len(images), "expected": provider_frame_count},
-                )
-            if len(selection) != job.action.frame_count:
+            requested_provider_frame_count = job.action.generation_frame_count
+            returned_provider_frame_count = len(images)
+            count_matches_preset = returned_provider_frame_count == requested_provider_frame_count
+            selection = (
+                job.action.generation_frame_selection
+                if count_matches_preset
+                else list(range(returned_provider_frame_count))
+            )
+            if count_matches_preset and len(selection) != job.action.frame_count:
                 raise ValidationHarnessError(
                     "provider frame selection does not match the project action",
                     details={"selection": selection, "project_frame_count": job.action.frame_count},
@@ -889,8 +959,13 @@ class SpritePipelineService:
                         "schema_version": 1,
                         "source_kind": "provider",
                         "diagnostic_only": diagnostic_only,
-                        "provider_frame_count": provider_frame_count,
-                        "project_frame_count": job.action.frame_count,
+                        "provider_frame_count": returned_provider_frame_count,
+                        "requested_provider_frame_count": requested_provider_frame_count,
+                        "project_frame_count": len(selection),
+                        "expected_project_frame_count": job.action.frame_count,
+                        "frame_count_policy": (
+                            "preset_selection" if count_matches_preset else "preserve_all_returned"
+                        ),
                         "provider_frame_selection": selection,
                         "provider_source_frames": source_manifest_frames,
                         "frames": manifest_frames,
@@ -940,8 +1015,12 @@ class SpritePipelineService:
                 "provider_frames_saved",
                 candidate_index=candidate_index,
                 frame_count=len(frames),
-                provider_frame_count=provider_frame_count,
+                provider_frame_count=returned_provider_frame_count,
+                requested_provider_frame_count=requested_provider_frame_count,
                 provider_frame_selection=selection,
+                frame_count_policy=(
+                    "preset_selection" if count_matches_preset else "preserve_all_returned"
+                ),
                 diagnostic_only=diagnostic_only,
             )
             return True
@@ -1033,11 +1112,26 @@ class SpritePipelineService:
             thresholds=self._qa_thresholds(job),
         )
         self._apply_qa_report(candidate, report)
+        if job.request.provider != "import" and len(candidate.frames) != job.action.frame_count:
+            candidate.warnings.insert(
+                0,
+                QAIssue(
+                    code="provider_frame_count_adjusted",
+                    severity=IssueSeverity.warning,
+                    message=(
+                        f"The provider returned {len(candidate.frames)} usable frames; "
+                        f"the action preset expected {job.action.frame_count}. All returned frames were preserved."
+                    ),
+                    metrics={
+                        "expected": job.action.frame_count,
+                        "actual": len(candidate.frames),
+                        "policy": "preserve_all_returned",
+                    },
+                ),
+            )
         preview_dir = self.store.job_dir(job_id) / "previews"
         prefix = preview_dir / candidate.candidate_id
-        sheet_columns = job.action.sheet_columns or job.character.sheet_columns
-        sheet_rows = job.action.sheet_rows
-        sheet_cells = job.action.frame_cells or None
+        sheet_columns, sheet_rows, sheet_cells = self._candidate_sheet_layout(job, candidate)
         preview_builders = (
             (
                 "sheet",
@@ -1367,8 +1461,11 @@ class SpritePipelineService:
                     details={"actual": options.columns, "expected": locked_columns},
                 )
             columns = locked_columns or options.columns or job.character.sheet_columns
-            rows = job.action.sheet_rows
-            frame_cells = job.action.frame_cells or None
+            _layout_columns, rows, frame_cells = self._candidate_sheet_layout(
+                job,
+                candidate,
+                columns=columns,
+            )
             export_dir = self.settings.exports_dir / job.character.character_id / job.action.action_id
             export_dir.mkdir(parents=True, exist_ok=True)
             stem = Path(options.filename).stem if options.filename else f"{job.character.character_id}_{job.action.action_id}"
@@ -1591,11 +1688,26 @@ class SpritePipelineService:
 
     @staticmethod
     def _candidate_expected_frame_count(job: JobRecord, candidate: CandidateRecord) -> int:
-        """Use imported content length without weakening provider generation contracts."""
+        """Check the usable sequence that was actually received."""
 
-        if job.request.provider == "import":
-            return len(candidate.frames)
-        return job.action.frame_count
+        return len(candidate.frames)
+
+    @staticmethod
+    def _candidate_sheet_layout(
+        job: JobRecord,
+        candidate: CandidateRecord,
+        *,
+        columns: int | None = None,
+    ) -> tuple[int, int | None, list[tuple[int, int]] | None]:
+        """Keep the project grid when possible and pad variable results safely."""
+
+        columns = columns or job.action.sheet_columns or job.character.sheet_columns
+        if len(candidate.frames) == job.action.frame_count:
+            return columns, job.action.sheet_rows, job.action.frame_cells or None
+
+        required_rows = math.ceil(len(candidate.frames) / columns)
+        rows = max(job.action.sheet_rows or 0, required_rows)
+        return columns, rows, None
 
     @staticmethod
     def _frame(candidate: CandidateRecord, frame_index: int) -> FrameRecord:

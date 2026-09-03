@@ -26,6 +26,9 @@ It never writes into formal game asset directories. Runtime jobs live under
   official REST contract.
 - Serial candidate generation; no credit-bearing POST retry after an ambiguous
   transport result.
+- Successful responses with a different image count preserve every valid frame,
+  surface a review warning, and pad the final project-width grid with transparent
+  trailing cells instead of discarding paid output.
 - Offline `fixture` provider for end-to-end diagnostics without a token. Its
   output is always marked `diagnostic_only` and is not production animation.
 - Import from ordered PNG directories, animated GIFs, regular Sprite Sheets,
@@ -125,7 +128,7 @@ From `Tools/SpritePipeline`:
 
 ```powershell
 .\harness.ps1 list-presets
-$created = .\harness.ps1 create --character your_character --action forward_thrust --provider pixellab --candidates 3 | ConvertFrom-Json
+$created = .\harness.ps1 create --character your_character --action forward_thrust --provider pixellab --candidates 1 | ConvertFrom-Json
 $jobId = $created.data.job.job_id
 .\harness.ps1 generate --job $jobId
 .\harness.ps1 status --job $jobId
@@ -148,9 +151,13 @@ launcher without changing machine policy:
 
 Every later `harness.ps1` example can be replaced verbatim with `harness.cmd`.
 
-Generation is sequential even with three candidates. `generate` waits by
-default. Use `--no-wait` to advance one submission/poll step, then call it again
-after inspecting the durable status.
+Each candidate is a separate generation submission, so the UI and examples
+default to one. Generation is sequential when more are requested. `generate`
+waits by default. Use `--no-wait` to advance one submission/poll step, then call
+it again after inspecting the durable status. To salvage an older candidate
+whose provider job completed but the former strict count check rejected, run
+`harness.ps1 recover --job <id> --candidate <n>`; recovery only polls the
+existing provider job and never submits a new generation.
 
 Review warnings before approval. The explicit acknowledgement is deliberate:
 
@@ -167,9 +174,10 @@ its output into the same checks:
 .\harness.ps1 ingest --job <job_id> --candidate 1 --source D:\candidate_frames --kind png_dir
 ```
 
-Sprite Sheet import requires `--kind sheet --columns N`. GIF and directory
-imports preserve their actual frame counts so QA—not silent truncation—reports
-a mismatch.
+Sprite Sheet import requires `--kind sheet --columns N`. Provider, GIF, and
+directory inputs preserve their actual usable frame counts. A provider count
+difference is a review warning; unreadable, inconsistent-size, or otherwise
+invalid frames remain blocking failures.
 
 See [CODEX_USAGE.md](CODEX_USAGE.md) for the stable orchestration contract and
 repair flow.
@@ -190,6 +198,7 @@ Interactive OpenAPI docs are at `http://127.0.0.1:8765/docs`. Main routes:
 | `POST` | `/v1/jobs` | Create from `GenerationRequest` JSON |
 | `POST` | `/v1/jobs/{id}/generate` | Submit/poll one or all candidates |
 | `GET` | `/v1/jobs/{id}` | Read the durable job record |
+| `POST` | `/v1/jobs/{id}/candidates/{n}/recover` | Poll an existing provider job without submitting a generation |
 | `POST` | `/v1/jobs/{id}/candidates/{n}/frames` | Import base64 PNG frames |
 | `POST` | `/v1/jobs/{id}/candidates/{n}/reviews/frame` | Save one frame review |
 | `POST` | `/v1/jobs/{id}/candidates/{n}/approve` | Explicitly approve a candidate |

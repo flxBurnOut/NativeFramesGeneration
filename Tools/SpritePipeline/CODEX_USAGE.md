@@ -14,6 +14,7 @@ On Windows, use `harness.cmd` when PowerShell execution policy blocks
 2. Call `create` once and retain `data.job.job_id` from the JSON response.
 3. For PixelLab, call `generate --job <id>`. For async control, add `--no-wait`
    and inspect `data.job.candidates[*].status` before calling again.
+   Start with one candidate because each candidate is a separate paid generation.
 4. Inspect each candidate's `hard_failures`, `warnings`, frame records, and the
    files in `work/<id>/previews/`.
 5. Never approve a hard failure. When warnings are acceptable, record the
@@ -43,6 +44,9 @@ Candidate states are `created`, `submitting`, `provider_pending`, `received`,
   its result is unknown. Do not automatically resubmit; doing so can double
   charge the account.
 - `provider_pending` is resumable using another `generate` call.
+- A failed candidate whose `provider_status` is `completed` and whose error is
+  the former frame-count contract can be salvaged with `recover --job <id>
+  --candidate <n>`. `recover` polls the existing provider job and never submits.
 - `check_failed` is never exportable.
 - `review_ready` requires explicit review/approval.
 - `fixture` results are diagnostic only even if QA passes.
@@ -52,7 +56,7 @@ Candidate states are `created`, `submitting`, `provider_pending`, `received`,
 Create from flags:
 
 ```powershell
-.\harness.ps1 create --character your_character --action idle --provider pixellab --candidates 3 --seed 12345
+.\harness.ps1 create --character your_character --action idle --provider pixellab --candidates 1 --seed 12345
 ```
 
 Run the bundled, offline diagnostic from a versioned request file:

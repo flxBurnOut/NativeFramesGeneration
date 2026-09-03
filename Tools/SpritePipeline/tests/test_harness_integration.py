@@ -389,6 +389,27 @@ class SpritePipelineIntegrationTests(unittest.TestCase):
             [3, 3, 3],
         )
 
+    def test_qa_treats_frame_count_difference_as_review_warning(self) -> None:
+        paths = self.harness.write_sequence(
+            self.root / "five_frame_sequence",
+            shifts=(0, 1, 2, 3, 4),
+        )
+        report = run_frame_qa(
+            paths,
+            expected_count=4,
+            expected_size=(64, 64),
+        )
+
+        self.assertTrue(report["exportable"])
+        self.assertNotIn(
+            "frame_count_mismatch",
+            [item["code"] for item in report["hard_failures"]],
+        )
+        self.assertIn(
+            "frame_count_mismatch",
+            [item["code"] for item in report["warnings"]],
+        )
+
     def test_qa_blocks_abrupt_whole_sprite_position_jump(self) -> None:
         paths = self.harness.write_sequence(
             self.root / "jumping_sequence",
@@ -1380,6 +1401,126 @@ class SpritePipelineIntegrationTests(unittest.TestCase):
         jobs = self._run_cli("list-jobs")
         self.assertEqual(jobs["operation"], "list-jobs")
         self.assertEqual([item["job_id"] for item in jobs["data"]["jobs"]], [job_id])
+
+    def test_provider_count_difference_preserves_frames_and_pads_sheet(self) -> None:
+        frame_dir = self.root / "provider_fixture" / "five_frames"
+        images = [
+            path.read_bytes()
+            for path in self.harness.write_sequence(frame_dir, shifts=(0, 1, 2, 3, 4))
+        ]
+        job = self.service.create_job(self.harness.create_request("pixellab"))
+        provider_job_id = "provider-returned-five"
+        with self.service.store.locked_job(job.job_id) as failed_job:
+            candidate = self._candidate(failed_job)
+            candidate.status = CandidateStatus.failed
+            candidate.provider_name = "pixellab"
+            candidate.provider_model = "animate-with-text-v3"
+            candidate.provider_job_id = provider_job_id
+            candidate.provider_status = "completed"
+            candidate.error = {
+                "code": "provider_contract_error",
+                "message": "provider returned a different frame count than requested",
+                "details": {"expected": 4, "actual": 5},
+            }
+            failed_job.status = JobStatus.failed
+
+        provider = CompletingThenFailingPollProvider(images)
+        provider.release_first.set()
+        with patch("sprite_pipeline.providers.get_provider", return_value=provider):
+            generated = self.service.recover_completed_candidate(
+                job.job_id,
+                1,
+            )
+
+        candidate = self._candidate(generated)
+        self.assertEqual(candidate.status, CandidateStatus.review_ready)
+        self.assertEqual(len(candidate.frames), 5)
+        self.assertEqual(candidate.hard_failures, [])
+        self.assertIn(
+            "provider_frame_count_adjusted",
+            [warning.code for warning in candidate.warnings],
+        )
+
+        raw_dir = self.service.store.job_dir(job.job_id) / "raw" / "candidate_01"
+        manifest = json.loads((raw_dir / "frames_manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["requested_provider_frame_count"], 4)
+        self.assertEqual(manifest["provider_frame_count"], 5)
+        self.assertEqual(manifest["project_frame_count"], 5)
+        self.assertEqual(manifest["frame_count_policy"], "preserve_all_returned")
+        self.assertEqual(manifest["provider_frame_selection"], [0, 1, 2, 3, 4])
+
+        preview_path = self.service.store.job_dir(job.job_id) / "previews" / "candidate_01.sheet.png"
+        with Image.open(preview_path) as opened:
+            preview = opened.convert("RGBA")
+        self.assertEqual(preview.size, (256, 128))
+        for column in (1, 2, 3):
+            alpha = preview.getchannel("A").crop((column * 64, 64, (column + 1) * 64, 128))
+            self.assertIsNone(alpha.getbbox(), column)
+
+        self.service.approve_candidate(
+            job.job_id,
+            1,
+            reviewer="frame-count-compatibility-test",
+            acknowledge_warnings=True,
+        )
+        exported = self.service.export_candidate(job.job_id, 1)
+        assert exported.export is not None
+        with Image.open(self.root / exported.export.sheet_path) as opened:
+            self.assertEqual(opened.size, (256, 128))
+        recipe = json.loads((self.root / exported.export.recipe_path).read_text(encoding="utf-8"))
+        self.assertEqual(recipe["frame_count"], 5)
+        self.assertEqual(recipe["rows"], 2)
+        self.assertEqual([tuple(cell) for cell in recipe["unused_cells"]], [(1, 1), (2, 1), (3, 1)])
+
+    def test_pixellab_preserves_valid_images_when_return_count_differs(self) -> None:
+        frame_payloads: list[bytes] = []
+        for shift in range(5):
+            frame_path = self.root / "provider_fixture" / f"extra_frame_{shift}.png"
+            self.harness.write_frame(frame_path, shift_x=shift)
+            frame_payloads.append(frame_path.read_bytes())
+        encoded_frames = [
+            {"type": "base64", "format": "png", "base64": base64.b64encode(payload).decode("ascii")}
+            for payload in frame_payloads
+        ]
+        client = FakePixelLabClient(
+            FakeResponse({"background_job_id": "job-extra", "status": "processing"}),
+            FakeResponse(
+                {
+                    "status": "completed",
+                    "last_response": {"images": encoded_frames, "frame_count": 4},
+                    "usage": {"credits": 1},
+                }
+            ),
+        )
+        provider = PixelLabProvider(
+            api_key="local-test-token",
+            base_url="https://unit.invalid",
+            http_client=client,
+            max_get_retries=0,
+        )
+        submission = provider.submit(
+            ProviderRequest(
+                reference_image=self.harness.reference_path.read_bytes(),
+                prompt="Move through four precise test poses.",
+                frame_count=4,
+                seed=123,
+                transparent_background=True,
+            )
+        )
+
+        completed = provider.poll(submission.provider_job_id)
+
+        self.assertEqual(completed.status, PollStatus.completed)
+        self.assertEqual(len(completed.images), 5)
+        self.assertEqual(
+            completed.raw_response["harness_frame_count"],
+            {
+                "requested": 4,
+                "declared": 4,
+                "returned": 5,
+                "policy": "preserve_all_returned_images",
+            },
+        )
 
     def test_pixellab_contract_with_injected_client_is_offline_and_redacted(self) -> None:
         frame_payloads: list[bytes] = []

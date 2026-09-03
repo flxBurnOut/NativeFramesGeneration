@@ -48,12 +48,13 @@ def run_frame_qa(
 ) -> dict[str, object]:
     """Run deterministic hard checks and warning heuristics on PNG frames.
 
-    Hard failures block export: missing/wrong count, corrupt files, unexpected
+    Hard failures block export: missing frames, corrupt files, unexpected
     dimensions, blank frames, missing source alpha, exact consecutive duplicate
     runs, and high-confidence sudden whole-sprite position jumps. Warnings cover
-    canvas-edge contact, safe-margin violations, area change from a reference,
-    adjacent centroid displacement/velocity jumps, palette deviation, loop
-    end/start difference, and grounded baseline drift.
+    a count different from the action preset, canvas-edge contact, safe-margin
+    violations, area change from a reference, adjacent centroid
+    displacement/velocity jumps, palette deviation, loop end/start difference,
+    and grounded baseline drift.
 
     ``thresholds`` accepts the keys in :data:`DEFAULT_QA_THRESHOLDS`:
 
@@ -106,10 +107,13 @@ def run_frame_qa(
             {"code": "no_frames", "message": "No PNG frames were found."}
         )
     if expected_count is not None and len(paths) != expected_count:
-        hard_failures.append(
+        warnings.append(
             {
                 "code": "frame_count_mismatch",
-                "message": f"Expected {expected_count} frames, found {len(paths)}.",
+                "message": (
+                    f"Expected {expected_count} frames, found {len(paths)}; "
+                    "all usable frames remain available for review."
+                ),
                 "expected": expected_count,
                 "actual": len(paths),
             }

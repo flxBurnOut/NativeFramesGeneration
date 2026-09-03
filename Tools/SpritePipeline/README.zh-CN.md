@@ -13,11 +13,11 @@
 
 ## 已完成
 
-- PixelLab 源序列严格支持 64×64、128×128 透明 PNG 帧格和 4–16 个偶数帧；项目目标帧数可为奇数，地面/空中攻击会保留完整 6 帧源记录，再确定性选成项目需要的 5 帧。
+- PixelLab 请求仍遵守 64×64、128×128 透明 PNG 帧格和 4–16 个偶数帧；若成功响应实际多回或少回帧，Harness 会保留全部有效图片、给出提醒，并按项目列数自动补透明尾格，不再丢弃已经付费的结果。
 - PixelLab V3 提交、Job ID 持久化、限时轮询、429/529 退避、脱敏请求/响应和用量记录。
 - 候选串行生成；POST 结果不明时不自动重试，防止重复扣费。
 - PNG 目录、GIF、规则 Sprite Sheet，以及由项目清单定义播放格位的稀疏 Sprite Sheet 导入。
-- 数量、尺寸、损坏、空白、无 Alpha、连续重复、相邻帧突变式位置跳跃等硬失败门禁。
+- 尺寸、损坏、空白、无 Alpha、连续重复、相邻帧突变式位置跳跃等硬失败门禁；帧数与预设不同改为人工确认提醒。
 - 安全边距、面积、质心、色板、循环首尾和脚底基线等角色级可配置警告。
 - Sheet、原尺寸/放大 GIF、逐帧网格、相邻帧叠影和项目参考线预览。
 - 逐帧标记、警告显式确认、最多两轮版本化坏帧替换。
@@ -99,7 +99,7 @@ $jobId = $created.data.job.job_id
 CLI 无交互，每次只输出一个 UTF-8 JSON 对象：
 
 ```powershell
-$created = .\harness.ps1 create --character your_character --action forward_thrust --provider pixellab --candidates 3 | ConvertFrom-Json
+$created = .\harness.ps1 create --character your_character --action forward_thrust --provider pixellab --candidates 1 | ConvertFrom-Json
 $jobId = $created.data.job.job_id
 .\harness.ps1 generate --job $jobId
 .\harness.ps1 status --job $jobId
@@ -109,7 +109,7 @@ $jobId = $created.data.job.job_id
 
 把 `your_character` 替换为已经通过 `list-presets` 校验的真实角色 ID。
 
-`generate` 默认等待并按候选串行执行；加 `--no-wait` 时只推进一次提交/轮询。遇到 `submitting` 且没有 Provider Job ID 时，Codex 不应重提；遇到 `provider_pending` 时可再次调用 `generate` 恢复轮询。
+每个候选都会单独提交一次付费生成，所以网页和示例默认只创建 1 个。`generate` 默认等待并按候选串行执行；加 `--no-wait` 时只推进一次提交/轮询。遇到 `submitting` 且没有 Provider Job ID 时，Codex 不应重提；遇到 `provider_pending` 时可再次调用 `generate` 恢复轮询。若旧候选显示 PixelLab 已完成、但因旧版帧数合同失败，可运行 `.\harness.ps1 recover --job <id> --candidate <n>`；该命令只查询已有 Provider Job ID，不会提交新的生成。
 
 完整的 Codex 状态与修补规则见 [CODEX_USAGE.md](CODEX_USAGE.md)。
 
@@ -132,7 +132,7 @@ $jobId = $created.data.job.job_id
 5. “导出”只显示已通过的动画，并输出固定网格 PNG；
 6. “API 与项目”作为独立设置页，管理 Key 和项目合同。
 
-生成后，任务会自动带入“播放检查”，无需填写任务 ID、候选编号或本机路径。生成提示要求角色根部的运动轨迹在相邻帧之间连续，但不要求人物始终固定在画布中央。若只是检查一张已有成品 Sheet，可在“播放检查”页展开对应入口；这条路径不依赖 API。自动检查负责发现尺寸、帧数、透明度、空白、重复、相邻帧突变式跳位、边距、重心、运动趋势、循环和脚底基线等问题；高置信度的突然跳位会阻止采用和导出，较复杂的姿势变化则给出提醒并交由人工判断。角色身份、服装、武器、肢体和动作意图仍需人工确认。
+生成后，任务会自动带入“播放检查”，无需填写任务 ID、候选编号或本机路径。生成提示要求角色根部的运动轨迹在相邻帧之间连续，但不要求人物始终固定在画布中央。若只是检查一张已有成品 Sheet，可在“播放检查”页展开对应入口；这条路径不依赖 API。模型实际返回帧数与预设不同时，所有有效帧仍会进入检查页，末行不足的格子保持透明；差异作为提醒交由人工确认。尺寸、透明度、空白、重复和相邻帧突变式跳位等真正不可用的问题仍会阻止采用和导出。角色身份、服装、武器、肢体和动作意图仍需人工确认。
 
 所有帧的外框始终保持项目规定的固定尺寸。工具不会为了“居中”而逐帧裁剪、扩框、缩放或平移人物，因为武器伸展和姿势变化会自然改变可见外接矩形，机械居中反而会破坏身体轨迹。检查页提供项目参考线和相邻帧叠影：紫红色表示前一帧，青色表示当前帧。连续的小幅位移是正常运动，前后画面突然大幅分离才属于连续性问题。需要修补时，可在“逐帧修补”上传一张外部修好的同尺寸透明 PNG；原图会保留，修补图作为新版本重新检查。
 
@@ -160,6 +160,8 @@ REST API：
 ```
 
 接口说明在 `http://127.0.0.1:8765/docs`。服务默认只监听本机；当前没有账号或权限系统，不应直接暴露到公网。
+
+已有 PixelLab 结果可用 `POST /v1/jobs/{id}/candidates/{n}/recover` 重新读取。该端点只轮询已有任务，不会创建新的生成请求。
 
 ## 验证与尚未包含的范围
 
