@@ -25,5 +25,8 @@ sprite-harness = "sprite_pipeline.cli:main"
 [tool.setuptools]
 packages = ["sprite_pipeline", "sprite_pipeline.providers", "sprite_pipeline.processing"]
 
+[tool.setuptools.package-data]
+sprite_pipeline = ["static/*"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

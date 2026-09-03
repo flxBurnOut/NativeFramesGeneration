@@ -14,8 +14,11 @@ The same `SpritePipelineService` is used by:
 - a loopback REST API for another tool or script;
 - a six-page, project-guided Gradio operator page.
 
-It never writes into formal game asset directories. Runtime jobs live under
-`work/`, and approved exports live under `exports/`; both are ignored by Git.
+It never writes into formal game asset directories or mixes normal user data
+with source code. Runtime jobs and user character packages default to
+`%LOCALAPPDATA%\SpritePipeline`; approved exports default to
+`Documents\SpritePipeline\Exports`. Passing `--root` explicitly enables
+portable/test mode.
 
 ## Implemented scope
 
@@ -26,6 +29,13 @@ It never writes into formal game asset directories. Runtime jobs live under
   official REST contract.
 - Serial candidate generation; no credit-bearing POST retry after an ambiguous
   transport result.
+- Live quota checks and an OS-backed cross-process lock around each chargeable
+  submission, shared by the UI, REST API, and CLI.
+- Documented dynamic unit estimation:
+  `ceil(width * height * provider_frame_count / 65536)`. A 128x128,
+  4/8/16-frame candidate costs approximately 1/2/4 subscription units.
+- Idempotent task creation, append-only task revisions, background restart
+  recovery, atomic result publication, and committed frame checksums.
 - Successful responses with a different image count preserve every valid frame,
   surface a review warning, and pad the final project-width grid with transparent
   trailing cells instead of discarding paid output.
@@ -40,25 +50,28 @@ It never writes into formal game asset directories. Runtime jobs live under
   jumps, palette deviation, loop closure, and grounded baseline drift.
 - Original/enlarged GIFs, enlarged indexed grid, adjacent-frame onion skins,
   project reference lines, and a preview sheet.
-- Explicit per-frame review, whole-candidate approval, two versioned replacement
-  attempts per bad frame, and deterministic staged export.
+- Explicit per-frame review, a lossless in-browser pixel editor, unlimited local
+  manual versions, two separately bounded external/future-AI replacements per
+  bad frame, and deterministic staged export.
 - Exported PNG, preview GIF, recipe JSON, and QA JSON.
 - A project-guided UI ordered as Guide & Example, Generate Animation, Playback
   Review, Frame Repair, and Export, with API/project settings last. Character
   source upload and identity/action prompts are integrated into generation.
 - A bundled Dreamweaver / Cyber Warrior profile: 128×128 RGBA cells, four
-  columns, anchor (64,106), and action-specific sheet height, playback cells,
-  timing, and filenames from the project asset contract.
+  columns, anchor (64,106), and a uniform sixteen-frame 4x4 / 512x512 output
+  sheet for every new action while retaining project timing and filenames.
 - Eleven bundled action templates. The project UI exposes idle, walk, jump,
   ground attack, air attack, hurt, backward evade, and defeated; three generic
   templates remain available to API/CLI users.
-- PixelLab keeps its even 4–16 source-frame contract. The five-frame ground and
-  air attacks generate six auditable source frames, then deterministically retain
-  five project frames and export them into the existing sparse grid layouts.
+- Every bundled action now requests and exports sixteen frames. The generic
+  import/recovery path still preserves valid non-sixteen and sparse legacy
+  sheets instead of discarding existing or already-paid artwork.
 
 PixelLab Edit Animation V2 and GPT-Image-2 automatic repair are intentionally
-not in V0.1. A repaired PNG can already be inserted with `replace-frame`; this
-keeps the review and export contract stable before adding another paid workflow.
+not in V0.1. The built-in editor already provides exact RGBA pencil, eraser,
+eyedropper, integer zoom, non-exported pixel grid, pan, undo/redo, crash-recovery
+drafts, and verified manual versions. A repaired PNG can still be inserted with
+the separately bounded `replace-frame` fallback.
 
 ## Install
 
@@ -68,7 +81,6 @@ Python 3.11 or newer is required.
 cd Tools\SpritePipeline
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
-Copy-Item .env.example .env
 ```
 
 If `python` is not on `PATH` on a Windows Codex host, bootstrap from the bundled runtime:
@@ -77,18 +89,14 @@ If `python` is not on `PATH` on a Windows Codex host, bootstrap from the bundled
 $codexPython = Join-Path $env:USERPROFILE '.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe'
 & $codexPython -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
-Copy-Item .env.example .env
 ```
 
-Save the PixelLab token from the UI's **API & Project** page (it takes effect
-without restarting), or put it in the local `.env` file:
-
-```dotenv
-PIXELLAB_API_KEY=your_token_here
-```
-
-The token is only placed in the Bearer header. Persisted provider records redact
-secrets and base64 image bodies.
+Save the PixelLab token from the UI's **API & Project** page; it takes effect
+without restarting. Windows stores it with current-user DPAPI protection. The
+token is only placed in the Bearer header, and persisted provider records redact
+secrets and base64 image bodies. Automated deployments may use the process
+environment variable `PIXELLAB_API_KEY`, but a real token should no longer be
+stored in the repository `.env`.
 
 ## Add a character
 
@@ -128,10 +136,11 @@ From `Tools/SpritePipeline`:
 
 ```powershell
 .\harness.ps1 list-presets
-$created = .\harness.ps1 create --character your_character --action forward_thrust --provider pixellab --candidates 1 | ConvertFrom-Json
+$created = .\harness.ps1 create --character your_character --action forward_thrust --provider pixellab --candidates 1 --request-key <stable-unique-value> | ConvertFrom-Json
 $jobId = $created.data.job.job_id
 .\harness.ps1 generate --job $jobId
 .\harness.ps1 status --job $jobId
+.\harness.ps1 safety --job $jobId --candidate 1
 ```
 
 On a Windows Codex host where `python` is not on `PATH`, use the included
@@ -152,9 +161,14 @@ launcher without changing machine policy:
 Every later `harness.ps1` example can be replaced verbatim with `harness.cmd`.
 
 Each candidate is a separate generation submission, so the UI and examples
-default to one. Generation is sequential when more are requested. `generate`
+default to one. One submission can consume more than one subscription unit;
+use `estimate --character <id> --action <id> --candidates <n>` first.
+Generation is sequential when more are requested. `generate`
 waits by default. Use `--no-wait` to advance one submission/poll step, then call
-it again after inspecting the durable status. To salvage an older candidate
+it again after inspecting the durable status. `recover-all` scans every durable
+task using only existing provider IDs. A `submission_unknown` candidate must
+never be resubmitted; attach a discovered original ID with
+`attach-provider-job`. To salvage an older candidate
 whose provider job completed but the former strict count check rejected, run
 `harness.ps1 recover --job <id> --candidate <n>`; recovery only polls the
 existing provider job and never submits a new generation.
@@ -195,17 +209,27 @@ Interactive OpenAPI docs are at `http://127.0.0.1:8765/docs`. Main routes:
 | Method | Route | Purpose |
 |---|---|---|
 | `GET` | `/health` | Local readiness and provider configuration |
-| `POST` | `/v1/jobs` | Create from `GenerationRequest` JSON |
+| `GET` | `/v1/system/storage` | Separated data paths and migration status |
+| `GET` | `/v1/account/balance` | Refresh the non-chargeable account balance |
+| `GET` | `/v1/account/estimate` | Estimate dynamic generation units locally |
+| `POST` | `/v1/jobs` | Idempotent create from `GenerationRequest` JSON |
 | `POST` | `/v1/jobs/{id}/generate` | Submit/poll one or all candidates |
 | `GET` | `/v1/jobs/{id}` | Read the durable job record |
+| `GET` | `/v1/jobs/{id}/candidates/{n}/safety` | Compact submit/result-integrity status |
+| `POST` | `/v1/recovery/run` | Safely resume all durable tasks |
 | `POST` | `/v1/jobs/{id}/candidates/{n}/recover` | Poll an existing provider job without submitting a generation |
+| `POST` | `/v1/jobs/{id}/candidates/{n}/attach-provider-job` | Bind a known ID after an ambiguous submission |
 | `POST` | `/v1/jobs/{id}/candidates/{n}/frames` | Import base64 PNG frames |
 | `POST` | `/v1/jobs/{id}/candidates/{n}/reviews/frame` | Save one frame review |
+| `GET` | `/v1/jobs/{id}/candidates/{n}/frames/{frame}/pixel-edit` | Read exact RGBA pixels and the base version hash |
+| `POST` | `/v1/jobs/{id}/candidates/{n}/frames/{frame}/pixel-edit` | Commit a verified manual RGBA version and re-run QA |
 | `POST` | `/v1/jobs/{id}/candidates/{n}/approve` | Explicitly approve a candidate |
 | `POST` | `/v1/jobs/{id}/candidates/{n}/export` | Export after the approval gate |
 
 The API intentionally defaults to loopback and has no authentication. Do not
 bind it to a public interface without adding access control and upload quotas.
+Send an `Idempotency-Key` header when creating a task; retry the same request
+with the same value after a client timeout to receive the original task.
 
 ## Operator UI
 
@@ -215,15 +239,17 @@ bind it to a public interface without adding access control and upload quotas.
 
 Open `http://127.0.0.1:7860`. The pages are Guide & Example, Generate Animation,
 Playback Review, Frame Repair, Export, and API & Project.
-Long PixelLab calls may occupy the local UI request; the JSON CLI or REST
-`wait=false` mode is better for external orchestration.
+The Generate page returns after the durable submit step and shows a four-stage
+task safety center. Closing or refreshing the browser does not stop the local
+recovery worker; reopening the task shows its saved state.
 
 Generate Animation accepts the character source PNG, reusable identity prompt,
 and action prompt on one page. A 128×128 single frame is used directly; a
 four-column project Sheet automatically contributes its first visible cell.
 Existing completed Sheets can be uploaded only from Playback Review, where a
-numbered grid is shown before they enter inspection. Repair uploads stay on
-their own page, and the diagnostic dummy appears only under Example.
+numbered grid is shown before they enter inspection. Frame Repair embeds the
+exact-pixel editor and keeps external PNG upload in a collapsed fallback.
+The diagnostic dummy appears only under Example.
 
 ## Tests
 
@@ -241,8 +267,8 @@ changes only a few interior RGB pixels because idle has no intended root motion.
 Other actions may move naturally. Generation prompts request a smooth
 frame-to-frame root trajectory, while QA blocks high-confidence sudden jumps
 without cropping, resizing, recentering, or changing the fixed cell dimensions.
-Cyber Warrior outputs match the existing assets: 512×512 for idle, walk, and
-defeated; 512×384 for jump, hurt, and air attack; and 512×256 for ground attack
-and the new backward evade. Backward evade is export-ready but still requires a
-new Godot animation/state mapping because it is not present in the supplied
-project manifest.
+New Cyber Warrior generations use one uniform 512×512, 4x4, sixteen-frame
+contract for every action. Existing lower-frame assets remain valid import and
+review inputs. Jump, ground attack, air attack, and hurt need their Godot frame
+lists updated before replacement; backward evade still requires a new animation
+and state mapping because it is not present in the supplied project manifest.

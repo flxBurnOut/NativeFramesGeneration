@@ -180,6 +180,12 @@ class GenerationRequest(StrictModel):
     frame_count: int | None = Field(default=None, ge=1, le=64)
     action_description: str | None = Field(default=None, max_length=1000)
     loop: bool | None = None
+    request_key: str | None = Field(
+        default=None,
+        min_length=8,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+    )
 
 class IssueSeverity(str, Enum):
     hard_failure = "hard_failure"
@@ -225,12 +231,18 @@ class FrameRecord(StrictModel):
     reviewed_by: str | None = None
     reviewed_at: datetime | None = None
     repair_attempts: int = Field(default=0, ge=0, le=2)
+    # Manual pixel-editor saves are lossless local versions and do not consume
+    # provider credits. Keep their counter separate from the deliberately
+    # bounded external/AI replacement attempts above.
+    manual_edit_versions: int = Field(default=0, ge=0)
 
 
 class CandidateStatus(str, Enum):
     created = "created"
     submitting = "submitting"
+    submission_unknown = "submission_unknown"
     provider_pending = "provider_pending"
+    saving = "saving"
     received = "received"
     check_failed = "check_failed"
     review_ready = "review_ready"
@@ -249,8 +261,16 @@ class CandidateRecord(StrictModel):
     diagnostic_only: bool = False
     provider_job_id: str | None = None
     provider_status: str | None = None
+    submission_started_at: datetime | None = None
+    submitted_at: datetime | None = None
+    last_polled_at: datetime | None = None
+    provider_completed_at: datetime | None = None
+    result_saved_at: datetime | None = None
+    submission_attempts: int = Field(default=0, ge=0, le=1)
     raw_request_path: str | None = None
     raw_response_path: str | None = None
+    result_manifest_path: str | None = None
+    result_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     frames: list[FrameRecord] = Field(default_factory=list)
     hard_failures: list[QAIssue] = Field(default_factory=list)
     warnings: list[QAIssue] = Field(default_factory=list)
@@ -262,7 +282,10 @@ class CandidateRecord(StrictModel):
 
 class JobStatus(str, Enum):
     created = "created"
+    submitting = "submitting"
     provider_pending = "provider_pending"
+    saving = "saving"
+    attention_required = "attention_required"
     review_required = "review_required"
     approved = "approved"
     exported = "exported"
@@ -288,6 +311,10 @@ class JobRecord(StrictModel):
     updated_at: datetime = Field(default_factory=utc_now)
     status: JobStatus = JobStatus.created
     request: GenerationRequest
+    request_fingerprint: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    generation_requested_at: datetime | None = None
+    quota_before: dict[str, Any] | None = None
+    quota_after: dict[str, Any] | None = None
     character: CharacterPreset
     action: ActionPreset
     character_preset_path: str

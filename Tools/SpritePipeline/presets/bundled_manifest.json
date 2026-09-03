@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "characters": [
+    "diagnostic_dummy",
+    "player_cyber"
+  ],
+  "actions": [
+    "attack",
+    "attack_in_air",
+    "backward_evade",
+    "death",
+    "forward_thrust",
+    "hurt",
+    "idle",
+    "jump",
+    "melee_attack",
+    "run",
+    "walk"
+  ]
+}

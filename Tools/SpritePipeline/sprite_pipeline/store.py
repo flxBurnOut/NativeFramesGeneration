@@ -8,7 +8,7 @@ import time
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Iterator
+from typing import Any, Iterator
 
 from pydantic import ValidationError
 
@@ -27,6 +27,27 @@ class JobStore:
     def __init__(self, settings: HarnessSettings) -> None:
         self.settings = settings
         self._lock = threading.RLock()
+
+    @contextmanager
+    def global_lock(self, name: str, *, timeout_seconds: float = 30.0) -> Iterator[None]:
+        if not re.fullmatch(r"[a-z0-9_.-]+", name):
+            raise ValidationHarnessError("invalid global lock name", details={"name": name})
+        lock_path = self.settings.jobs_dir / ".locks" / f"{name}.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._file_lock(lock_path, timeout_seconds=timeout_seconds, operation=name):
+            yield
+
+    @contextmanager
+    def creation_lock(self, *, timeout_seconds: float = 30.0) -> Iterator[None]:
+        with self.global_lock("job_creation", timeout_seconds=timeout_seconds):
+            yield
+
+    @contextmanager
+    def submission_lock(self, *, timeout_seconds: float = 180.0) -> Iterator[None]:
+        """Serialize every chargeable provider submission across processes."""
+
+        with self.global_lock("chargeable_submission", timeout_seconds=timeout_seconds):
+            yield
 
     @contextmanager
     def _process_lock(self, job_id: str, *, timeout_seconds: float = 30.0) -> Iterator[None]:
@@ -125,17 +146,70 @@ class JobStore:
     def save(self, job: JobRecord) -> Path:
         with self._lock:
             path = self.job_dir(job.job_id) / "job.json"
+            # Each revision is written to an append-only recovery journal before
+            # the current pointer. If job.json is ever damaged, the latest valid
+            # journal record still contains the complete durable task.
+            history = self.job_dir(job.job_id) / "history" / f"job_{job.revision:08d}.json"
+            atomic_write_json(history, job.model_dump(mode="json"))
             atomic_write_json(path, job.model_dump(mode="json"))
             return path
 
     def load(self, job_id: str) -> JobRecord:
         path = self.job_dir(job_id) / "job.json"
-        if not path.is_file():
+        primary_error: Exception | None = None
+        primary: JobRecord | None = None
+        if path.is_file():
+            try:
+                primary = JobRecord.model_validate(read_json(path))
+                if primary.job_id != job_id:
+                    raise ValueError("current job record belongs to a different job")
+            except (ValidationError, ValueError, OSError) as exc:
+                primary_error = exc
+        history_dir = self.job_dir(job_id) / "history"
+        latest_history: JobRecord | None = None
+        for recovery_path in sorted(history_dir.glob("job_*.json"), reverse=True):
+            try:
+                recovered = JobRecord.model_validate(read_json(recovery_path))
+                filename_revision = int(recovery_path.stem.rsplit("_", 1)[1])
+                if recovered.job_id != job_id or recovered.revision != filename_revision:
+                    continue
+                latest_history = recovered
+                break
+            except (ValidationError, ValueError, OSError, IndexError):
+                continue
+        if primary is not None and latest_history is not None:
+            # save() publishes the journal before job.json. A crash between
+            # those writes leaves a valid but stale current pointer. Selecting
+            # the highest durable revision preserves a just-returned provider
+            # job ID and prevents an unsafe second POST.
+            return latest_history if latest_history.revision > primary.revision else primary
+        if primary is not None:
+            return primary
+        if latest_history is not None:
+            return latest_history
+        if not path.is_file() and not history_dir.is_dir():
             raise NotFoundError("job not found", details={"job_id": job_id})
-        try:
-            return JobRecord.model_validate(read_json(path))
-        except (ValidationError, ValueError) as exc:
-            raise ValidationHarnessError("job record is invalid", details={"job_id": job_id, "error": str(exc)}) from exc
+        raise ValidationHarnessError(
+            "job record and its recovery journal are invalid",
+            details={"job_id": job_id, "error": str(primary_error) if primary_error else "no valid revision"},
+        )
+
+    def find_by_request_key(self, request_key: str) -> JobRecord | None:
+        if not request_key:
+            return None
+        directories = [
+            path
+            for path in self.settings.jobs_dir.iterdir()
+            if path.is_dir() and _JOB_ID.fullmatch(path.name)
+        ]
+        for directory in sorted(directories, key=lambda item: item.name, reverse=True):
+            try:
+                job = self.load(directory.name)
+            except Exception:
+                continue
+            if job.request.request_key == request_key:
+                return job
+        return None
 
     def snapshot_file(self, job_id: str, source: Path, filename: str) -> str:
         if not filename or Path(filename).name != filename or filename in {".", ".."}:
@@ -150,16 +224,34 @@ class JobStore:
     def resolve_job_path(self, job_id: str, relative: str) -> Path:
         return inside(self.job_dir(job_id), self.job_dir(job_id) / Path(relative))
 
-    def list_jobs(self) -> list[dict[str, str]]:
-        result: list[dict[str, str]] = []
+    def list_jobs(self) -> list[dict[str, Any]]:
+        result: list[dict[str, Any]] = []
         if not self.settings.work_dir.exists():
             return result
-        for path in sorted(self.settings.work_dir.glob("*/job.json"), reverse=True):
+        directories = [
+            path
+            for path in self.settings.work_dir.iterdir()
+            if path.is_dir() and _JOB_ID.fullmatch(path.name)
+        ]
+        for directory in sorted(directories, key=lambda item: item.name, reverse=True):
             try:
-                job = JobRecord.model_validate(read_json(path))
-                result.append({"job_id": job.job_id, "status": job.status.value, "updated_at": job.updated_at.isoformat()})
+                job = self.load(directory.name)
+                result.append(
+                    {
+                        "job_id": job.job_id,
+                        "status": job.status.value,
+                        "updated_at": job.updated_at.isoformat(),
+                        "created_at": job.created_at.isoformat(),
+                        "provider": job.request.provider,
+                        "character_id": job.character.character_id,
+                        "character_name": job.character.display_name,
+                        "action_id": job.action.action_id,
+                        "action_name": job.action.display_name or job.action.action_id,
+                        "generation_requested": job.generation_requested_at is not None,
+                    }
+                )
             except Exception:
-                result.append({"job_id": path.parent.name, "status": "invalid", "updated_at": ""})
+                result.append({"job_id": directory.name, "status": "invalid", "updated_at": ""})
         return result
 
     @contextmanager

@@ -440,6 +440,51 @@ class PixelLabProvider(SpriteProvider):
 
         return self._completed_result(job_id, response_json, raw_response, usage)
 
+    def get_balance(self) -> dict[str, Any]:
+        """Return a bounded, redacted account balance without exposing the key."""
+
+        httpx = self._httpx_for_errors()
+        timeout_errors = (httpx.TimeoutException,) if httpx is not None else ()
+        request_errors = (httpx.RequestError,) if httpx is not None else ()
+        url = f"{self.api_root}/balance"
+        response: Any | None = None
+        for retry_index in range(self.max_get_retries + 1):
+            try:
+                response = self._get_client().get(url)
+            except timeout_errors as exc:
+                raise ProviderTemporaryError(
+                    "PixelLab balance request timed out",
+                    details={"safe_to_retry": True, "error_type": type(exc).__name__},
+                ) from exc
+            except request_errors as exc:
+                raise ProviderTemporaryError(
+                    "PixelLab balance request connection failed",
+                    details={"safe_to_retry": True, "error_type": type(exc).__name__},
+                ) from exc
+            if response.status_code not in {429, 529} or retry_index >= self.max_get_retries:
+                break
+            self._sleep(self._retry_delay(response, retry_index))
+
+        assert response is not None
+        if response.status_code != 200:
+            status_code = int(response.status_code)
+            details = {
+                "http_status": status_code,
+                "safe_to_retry": status_code in {429, 529} or status_code >= 500,
+                "response": self._best_effort_response_record(response),
+            }
+            if details["safe_to_retry"]:
+                raise ProviderTemporaryError("PixelLab balance request failed temporarily", details=details)
+            raise ProviderPermanentError("PixelLab balance request was rejected", details=details)
+        try:
+            payload = self._json_object(response)
+        except _ResponseShapeError as exc:
+            raise ProviderTemporaryError(
+                "PixelLab balance response was invalid",
+                details={"safe_to_retry": True, "reason": str(exc)},
+            ) from exc
+        return self._response_record(payload, response.status_code)
+
     def _completed_result(
         self,
         job_id: str,

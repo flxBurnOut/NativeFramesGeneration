@@ -354,19 +354,20 @@ class SpritePipelineIntegrationTests(unittest.TestCase):
             self.service.create_character_preset(display_name="No alpha", reference_image=no_alpha)
 
     def test_bundled_action_prompts_fit_the_pixellab_limit(self) -> None:
-        character = CharacterPreset.model_validate(
-            json.loads(
-                (PROJECT_ROOT / "presets" / "characters" / "diagnostic_dummy" / "character.json").read_text(
-                    encoding="utf-8"
-                )
-            )
-        )
+        character_paths = [
+            PROJECT_ROOT / "presets" / "characters" / character_id / "character.json"
+            for character_id in ("diagnostic_dummy", "player_cyber")
+        ]
         action_paths = sorted((PROJECT_ROOT / "presets" / "actions").glob("*.json"))
         self.assertEqual(len(action_paths), 11)
-        for path in action_paths:
-            action = ActionPreset.model_validate(json.loads(path.read_text(encoding="utf-8")))
-            with self.subTest(action=action.action_id):
-                self.assertLessEqual(len(compose_generation_prompt(character, action)), 1000)
+        for character_path in character_paths:
+            character = CharacterPreset.model_validate(
+                json.loads(character_path.read_text(encoding="utf-8"))
+            )
+            for path in action_paths:
+                action = ActionPreset.model_validate(json.loads(path.read_text(encoding="utf-8")))
+                with self.subTest(character=character.character_id, action=action.action_id):
+                    self.assertLessEqual(len(compose_generation_prompt(character, action)), 1000)
 
     def test_qa_allows_small_consistent_whole_sprite_motion(self) -> None:
         paths = self.harness.write_sequence(
@@ -658,6 +659,59 @@ class SpritePipelineIntegrationTests(unittest.TestCase):
         sheet_export = self.root / exported.export.sheet_path
         with Image.open(sheet_export) as exported_image:
             self.assertEqual(exported_image.size, (512, 256))
+
+    def test_uniform_sixteen_frame_action_can_inspect_a_legacy_twelve_frame_sheet(self) -> None:
+        action_path = self.harness.action_dir / f"{self.harness.action_id}.json"
+        action_payload = json.loads(action_path.read_text(encoding="utf-8"))
+        action_payload.update(
+            {
+                "frame_count": 16,
+                "sheet_columns": 4,
+                "sheet_rows": 4,
+            }
+        )
+        self.harness._write_json(action_path, action_payload)
+
+        source_path = self.root / "incoming" / "legacy_twelve_frames.png"
+        source_path.parent.mkdir(parents=True)
+        source_sheet = Image.new("RGBA", (64 * 4, 64 * 3), (0, 0, 0, 0))
+        frame_cells = [(index % 4, index // 4) for index in range(12)]
+        for index, (column, row) in enumerate(frame_cells):
+            frame_path = self.root / "incoming" / f"legacy_pose_{index:02d}.png"
+            self.harness.write_frame(frame_path, shift_x=index)
+            with Image.open(frame_path) as opened:
+                source_sheet.alpha_composite(opened.convert("RGBA"), (column * 64, row * 64))
+        source_sheet.save(source_path, format="PNG", optimize=False, compress_level=9)
+
+        job = self.service.create_job(self.harness.create_request("import"))
+        checked = self.service.ingest_candidate(
+            job.job_id,
+            1,
+            source_path,
+            source_kind="sheet",
+            columns=4,
+            frame_cells=frame_cells,
+        )
+        candidate = self._candidate(checked)
+        self.assertEqual(len(candidate.frames), 12)
+        self.assertEqual(candidate.status, CandidateStatus.review_ready)
+        self.assertIn("frame_count_mismatch", {issue.code for issue in candidate.warnings})
+        self.assertEqual(candidate.hard_failures, [])
+
+        self.service.approve_candidate(
+            job.job_id,
+            1,
+            reviewer="legacy-layout-test",
+            acknowledge_warnings=True,
+        )
+        exported = self.service.export_candidate(job.job_id, 1)
+        assert exported.export is not None
+        with Image.open(self.root / exported.export.sheet_path) as exported_sheet:
+            self.assertEqual(exported_sheet.size, (256, 256))
+        recipe = json.loads((self.root / exported.export.recipe_path).read_text(encoding="utf-8"))
+        self.assertEqual(recipe["frame_count"], 12)
+        self.assertEqual(recipe["rows"], 4)
+        self.assertEqual(len(recipe["unused_cells"]), 4)
 
     def test_import_sheet_keeps_internal_transparent_cells_and_provider_count_stays_even(self) -> None:
         sheet_path = self.root / "incoming" / "internal_gap.png"
@@ -1371,6 +1425,236 @@ class SpritePipelineIntegrationTests(unittest.TestCase):
             original_raw_bytes,
         )
 
+    def test_manual_pixel_edit_changes_exact_rgba_and_preserves_raw(self) -> None:
+        checked = self._ingest_clean_candidate()
+        original = self._candidate(checked).frames[0]
+        original_raw_path = original.raw_path
+        original_raw_bytes = self.service.store.resolve_job_path(
+            checked.job_id,
+            original_raw_path,
+        ).read_bytes()
+        self.service.review_frame(
+            checked.job_id,
+            1,
+            {
+                "frame_index": 0,
+                "status": "repair_requested",
+                "issue_type": IssueType.pose_error.value,
+                "note": "one pixel needs correction",
+                "reviewer": "integration-test",
+            },
+        )
+        session = self.service.get_frame_edit_session(checked.job_id, 1, 0)
+        self.assertTrue(session["can_edit"])
+        self.assertEqual((session["width"], session["height"]), (64, 64))
+        before = session["rgba"]
+        edited = bytearray(before)
+        x, y = 7, 9
+        offset = (y * session["width"] + x) * 4
+        edited[offset : offset + 4] = bytes((17, 34, 51, 255))
+        self.assertEqual(
+            sum(
+                before[index : index + 4] != bytes(edited[index : index + 4])
+                for index in range(0, len(before), 4)
+            ),
+            1,
+        )
+
+        saved = self.service.edit_frame_pixels(
+            checked.job_id,
+            1,
+            0,
+            rgba=bytes(edited),
+            width=session["width"],
+            height=session["height"],
+            base_sha256=session["base_sha256"],
+            reviewer="integration-test",
+        )
+
+        frame = self._candidate(saved).frames[0]
+        self.assertEqual(frame.manual_edit_versions, 1)
+        self.assertEqual(frame.repair_attempts, 0)
+        self.assertEqual(frame.review_status, ReviewStatus.pending)
+        self.assertEqual(frame.raw_path, original_raw_path)
+        self.assertIn("frame_000_manual_v001.png", frame.active_path)
+        active_path = self.service.store.resolve_job_path(saved.job_id, frame.active_path)
+        with Image.open(active_path) as opened:
+            opened.load()
+            actual = opened.convert("RGBA").tobytes()
+        self.assertEqual(actual, bytes(edited))
+        self.assertEqual(actual[:offset], before[:offset])
+        self.assertEqual(actual[offset + 4 :], before[offset + 4 :])
+        metadata = json.loads(active_path.with_suffix(".meta.json").read_text(encoding="utf-8"))
+        self.assertEqual(metadata["changed_pixel_count"], 1)
+        self.assertEqual(metadata["changed_bbox"], [x, y, x + 1, y + 1])
+        self.assertEqual(
+            self.service.store.resolve_job_path(saved.job_id, original_raw_path).read_bytes(),
+            original_raw_bytes,
+        )
+
+        reloaded = self.service.get_frame_edit_session(saved.job_id, 1, 0)
+        self.assertEqual(reloaded["rgba"], bytes(edited))
+        self.assertFalse(reloaded["can_edit"])
+        self.assertEqual(reloaded["manual_edit_versions"], 1)
+
+    def test_manual_pixel_edits_are_unbounded_and_reject_stale_or_invalid_data(self) -> None:
+        current = self._ingest_clean_candidate()
+        stale_sha256 = None
+        for version in range(1, 4):
+            self.service.review_frame(
+                current.job_id,
+                1,
+                {
+                    "frame_index": 0,
+                    "status": "repair_requested",
+                    "issue_type": IssueType.other.value,
+                    "note": f"manual edit {version}",
+                    "reviewer": "integration-test",
+                },
+            )
+            session = self.service.get_frame_edit_session(current.job_id, 1, 0)
+            if stale_sha256 is None:
+                stale_sha256 = session["base_sha256"]
+            edited = bytearray(session["rgba"])
+            offset = (version * session["width"] + version) * 4
+            edited[offset : offset + 4] = bytes((version, version + 10, version + 20, 255))
+            current = self.service.edit_frame_pixels(
+                current.job_id,
+                1,
+                0,
+                rgba=bytes(edited),
+                width=session["width"],
+                height=session["height"],
+                base_sha256=session["base_sha256"],
+            )
+            self.assertEqual(self._candidate(current).frames[0].manual_edit_versions, version)
+
+        self.service.review_frame(
+            current.job_id,
+            1,
+            {
+                "frame_index": 0,
+                "status": "repair_requested",
+                "issue_type": IssueType.other.value,
+                "reviewer": "integration-test",
+            },
+        )
+        latest = self.service.get_frame_edit_session(current.job_id, 1, 0)
+        changed = bytearray(latest["rgba"])
+        changed[0:4] = bytes((200, 100, 50, 255))
+        with self.assertRaisesRegex(ConflictError, "stale"):
+            self.service.edit_frame_pixels(
+                current.job_id,
+                1,
+                0,
+                rgba=bytes(changed),
+                width=latest["width"],
+                height=latest["height"],
+                base_sha256=str(stale_sha256),
+            )
+        with self.assertRaisesRegex(ValidationHarnessError, "byte count"):
+            self.service.edit_frame_pixels(
+                current.job_id,
+                1,
+                0,
+                rgba=b"short",
+                width=latest["width"],
+                height=latest["height"],
+                base_sha256=latest["base_sha256"],
+            )
+        persisted = self.service.get_job(current.job_id)
+        self.assertEqual(self._candidate(persisted).frames[0].manual_edit_versions, 3)
+
+    def test_pixel_editor_page_and_rest_round_trip(self) -> None:
+        from fastapi.testclient import TestClient
+
+        from sprite_pipeline.api_app import create_api
+
+        checked = self._ingest_clean_candidate()
+        self.service.review_frame(
+            checked.job_id,
+            1,
+            {
+                "frame_index": 0,
+                "status": "repair_requested",
+                "issue_type": IssueType.other.value,
+                "reviewer": "api-test",
+            },
+        )
+        with TestClient(create_api(self.root)) as client:
+            page = client.get(
+                f"/pixel-editor?job_id={checked.job_id}&candidate=1&frame=0"
+            )
+            self.assertEqual(page.status_code, 200)
+            self.assertIn("精确像素画布", page.text)
+            script = client.get("/pixel-editor-assets/pixel_editor.js?v=1")
+            self.assertEqual(script.status_code, 200)
+            self.assertIn("imageSmoothingEnabled = false", script.text)
+
+            response = client.get(
+                f"/v1/jobs/{checked.job_id}/candidates/1/frames/0/pixel-edit"
+            )
+            self.assertEqual(response.status_code, 200)
+            session = response.json()["data"]["session"]
+            pixels = bytearray(base64.b64decode(session["rgba_base64"]))
+            pixels[0:4] = bytes((91, 92, 93, 255))
+            saved = client.post(
+                f"/v1/jobs/{checked.job_id}/candidates/1/frames/0/pixel-edit",
+                json={
+                    "width": session["width"],
+                    "height": session["height"],
+                    "rgba_base64": base64.b64encode(pixels).decode("ascii"),
+                    "base_sha256": session["base_sha256"],
+                    "reviewer": "api-test",
+                },
+            )
+            self.assertEqual(saved.status_code, 200, saved.text)
+            self.assertEqual(saved.json()["data"]["edit"]["manual_edit_versions"], 1)
+
+    def test_codex_cli_can_commit_a_manual_pixel_edit_version(self) -> None:
+        checked = self._ingest_clean_candidate()
+        self.service.review_frame(
+            checked.job_id,
+            1,
+            {
+                "frame_index": 0,
+                "status": "repair_requested",
+                "issue_type": IssueType.other.value,
+                "reviewer": "cli-test",
+            },
+        )
+        session = self.service.get_frame_edit_session(checked.job_id, 1, 0)
+        edited = bytearray(session["rgba"])
+        edited[4:8] = bytes((11, 22, 33, 255))
+        source = self.root / "incoming" / "codex_pixel_edit.png"
+        source.parent.mkdir(parents=True, exist_ok=True)
+        Image.frombytes(
+            "RGBA",
+            (session["width"], session["height"]),
+            bytes(edited),
+        ).save(source, format="PNG")
+
+        payload = self._run_cli(
+            "pixel-edit-frame",
+            "--job",
+            checked.job_id,
+            "--candidate",
+            "1",
+            "--frame",
+            "0",
+            "--source",
+            str(source),
+            "--base-sha256",
+            session["base_sha256"],
+            "--reviewer",
+            "codex",
+        )
+
+        self.assertEqual(payload["operation"], "pixel-edit-frame")
+        frame = payload["data"]["job"]["candidates"][0]["frames"][0]
+        self.assertEqual(frame["manual_edit_versions"], 1)
+        self.assertEqual(frame["repair_attempts"], 0)
+
     def test_cli_list_create_status_are_single_line_json_contracts(self) -> None:
         listed = self._run_cli("list-presets")
         self.assertEqual(listed["operation"], "list-presets")
@@ -1397,6 +1681,35 @@ class SpritePipelineIntegrationTests(unittest.TestCase):
         self.assertEqual(status["operation"], "status")
         self.assertEqual(status["data"]["job"]["job_id"], job_id)
         self.assertEqual(status["data"]["job"]["status"], "created")
+
+        safety = self._run_cli(
+            "safety",
+            "--job",
+            job_id,
+            "--candidate",
+            "1",
+        )
+        self.assertEqual(safety["operation"], "safety")
+        self.assertEqual(safety["data"]["safety"]["stage"], "created")
+        self.assertTrue(safety["data"]["safety"]["local_task_saved"])
+        self.assertFalse(
+            safety["data"]["safety"]["automatic_resubmission_allowed"]
+        )
+
+        estimate = self._run_cli(
+            "estimate",
+            "--character",
+            self.harness.character_id,
+            "--action",
+            self.harness.action_id,
+            "--candidates",
+            "2",
+        )
+        self.assertEqual(estimate["operation"], "estimate")
+        self.assertEqual(
+            estimate["data"]["estimate"]["maximum_generation_units"],
+            2,
+        )
 
         jobs = self._run_cli("list-jobs")
         self.assertEqual(jobs["operation"], "list-jobs")

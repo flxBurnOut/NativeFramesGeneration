@@ -11,6 +11,7 @@ import io
 import json
 import math
 import re
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -25,7 +26,9 @@ from .errors import (
     ProviderTemporaryError,
     ValidationHarnessError,
 )
-from .jsonio import atomic_write_json, relative_posix, sha256_file
+from .jsonio import atomic_write_json, read_json, relative_posix, sha256_file
+from .credential_store import CredentialStore
+from .migration import LegacyLayoutMigrator
 from .models import (
     ActionPreset,
     Anchor,
@@ -51,12 +54,24 @@ from .store import JobStore
 
 
 QA_ALGORITHM_VERSION = "sprite-pipeline-qa-v2"
+PIXELLAB_GENERATION_UNIT_PIXELS = 64 * 64 * 16
 
 
 class SpritePipelineService:
     """The only application layer used by CLI, REST API, and Gradio."""
 
     def __init__(self, root: str | Path | None = None) -> None:
+        self._root_argument = root
+        self.settings = HarnessSettings.load(root)
+        self.settings.ensure_directories()
+        migration_store = JobStore(self.settings)
+        with migration_store.global_lock(
+            "legacy_migration",
+            timeout_seconds=300.0,
+        ):
+            self.migration_report = LegacyLayoutMigrator(self.settings).run()
+        # Migration may have moved a legacy plaintext key into protected
+        # storage, so resolve settings once more before creating providers.
         self.settings = HarnessSettings.load(root)
         self.settings.ensure_directories()
         self.presets = PresetRepository(self.settings)
@@ -82,6 +97,7 @@ class SpritePipelineService:
         sheet_columns: int = 4,
         anchor_x: int | None = None,
         anchor_ground_y: int | None = None,
+        reuse_if_identical: bool = False,
     ) -> CharacterPreset:
         """Create a minimal reusable character package from one approved idle PNG."""
 
@@ -127,12 +143,34 @@ class SpritePipelineService:
         if base_id == "diagnostic_dummy":
             raise ConflictError("the diagnostic character ID is reserved")
 
-        characters_dir = self.settings.presets_dir / "characters"
+        characters_dir = self.settings.user_characters_dir
         characters_dir.mkdir(parents=True, exist_ok=True)
         selected_id = base_id
+        if reuse_if_identical and self.presets.character_exists(base_id):
+            existing, existing_path = self.presets.load_character(base_id)
+            existing_reference = existing_path.parent / existing.reference_frame
+            same_contract = (
+                existing.display_name == name
+                and existing.facing == facing
+                and existing.identity_description
+                == (
+                    identity_description.strip()
+                    or "Preserve the exact identity, outfit, proportions, equipment, silhouette, and colors from the approved reference image."
+                )
+                and existing.sheet_columns == sheet_columns
+                and (anchor_x is None or existing.anchor.x == anchor_x)
+                and (anchor_ground_y is None or existing.anchor.ground_y == anchor_ground_y)
+                and sha256_file(existing_reference) == sha256_file(source)
+            )
+            if same_contract:
+                return existing
+            raise ConflictError(
+                "idempotent character ID already contains different source data",
+                details={"character_id": base_id},
+            )
         for suffix in range(1, 1000):
             candidate_id = base_id if suffix == 1 else f"{base_id}_{suffix:03d}"
-            if not (characters_dir / candidate_id).exists():
+            if not self.presets.character_exists(candidate_id):
                 selected_id = candidate_id
                 break
         else:
@@ -200,6 +238,7 @@ class SpritePipelineService:
         sheet_columns: int = 4,
         anchor_x: int | None = None,
         anchor_ground_y: int | None = None,
+        reuse_if_identical: bool = False,
     ) -> CharacterPreset:
         """Create a reusable character package from one cell of a regular PNG sheet."""
 
@@ -259,49 +298,135 @@ class SpritePipelineService:
                 sheet_columns=sheet_columns,
                 anchor_x=anchor_x,
                 anchor_ground_y=anchor_ground_y,
+                reuse_if_identical=reuse_if_identical,
             )
 
     def configure_pixellab_api_key(self, api_key: str | None) -> bool:
-        """Persist the PixelLab key without returning or logging its value."""
+        """Persist the PixelLab key in the OS-bound credential store."""
 
         key = (api_key or "").strip()
         if key and (len(key) < 8 or any(char.isspace() for char in key)):
             raise ValidationHarnessError("PixelLab API key format is invalid")
-        env_path = self.settings.root / ".env"
-        lines = env_path.read_text(encoding="utf-8").splitlines() if env_path.is_file() else []
-        updated: list[str] = []
-        replaced = False
-        for line in lines:
-            if line.strip().startswith("PIXELLAB_API_KEY="):
-                if key:
-                    updated.append(f"PIXELLAB_API_KEY={key}")
-                replaced = True
-            else:
-                updated.append(line)
-        if key and not replaced:
-            if updated and updated[-1].strip():
-                updated.append("")
-            updated.append(f"PIXELLAB_API_KEY={key}")
-        payload = "\n".join(updated).rstrip() + "\n" if updated else ""
-        descriptor, temp_name = tempfile.mkstemp(prefix=".env.", suffix=".tmp", dir=self.settings.root)
-        try:
-            with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
-                handle.write(payload)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temp_name, env_path)
-        except Exception:
-            try:
-                os.unlink(temp_name)
-            except FileNotFoundError:
-                pass
-            raise
-        loaded = HarnessSettings.load(self.settings.root)
-        object.__setattr__(loaded, "pixellab_api_key", key or None)
+        if os.environ.get("PIXELLAB_API_KEY", "").strip():
+            raise ConflictError(
+                "PIXELLAB_API_KEY is controlled by the process environment and cannot be changed in the UI"
+            )
+        CredentialStore(self.settings.config_dir).set("pixellab_api_key", key or None)
+        loaded = HarnessSettings.load(self._root_argument)
         self.settings = loaded
         self.presets.settings = loaded
         self.store.settings = loaded
         return bool(key)
+
+    def storage_status(self) -> dict[str, Any]:
+        credential_status = CredentialStore(self.settings.config_dir).public_status()
+        credential_status["active_source"] = (
+            "environment"
+            if os.environ.get("PIXELLAB_API_KEY", "").strip()
+            else "protected_store"
+            if self.settings.pixellab_api_key
+            else "none"
+        )
+        return {
+            "paths": self.settings.public_paths(),
+            "credentials": credential_status,
+            "migration": self.migration_report,
+        }
+
+    def get_cached_balance(self) -> dict[str, Any] | None:
+        path = self.settings.config_dir / "pixellab_balance.json"
+        if not path.is_file():
+            return None
+        try:
+            from .jsonio import read_json
+
+            payload = read_json(path)
+            return payload if isinstance(payload, dict) else None
+        except Exception:
+            return None
+
+    def refresh_pixellab_balance(self) -> dict[str, Any]:
+        from .providers import get_provider
+
+        provider = get_provider("pixellab", self.settings)
+        return self._refresh_balance_with_provider(provider)
+
+    def _refresh_balance_with_provider(self, provider: Any) -> dict[str, Any]:
+        get_balance = getattr(provider, "get_balance", None)
+        if get_balance is None:
+            raise ValidationHarnessError("configured provider does not expose account balance")
+        balance = get_balance()
+        snapshot = {
+            "schema_version": 1,
+            "provider": "pixellab",
+            "checked_at": utc_now().isoformat(),
+            "balance": balance,
+        }
+        atomic_write_json(self.settings.config_dir / "pixellab_balance.json", snapshot)
+        return snapshot
+
+    @staticmethod
+    def _remaining_generations(snapshot: dict[str, Any]) -> float | None:
+        balance = snapshot.get("balance")
+        subscription = balance.get("subscription") if isinstance(balance, dict) else None
+        if not isinstance(subscription, dict):
+            return None
+        for name in ("generations", "remaining", "remaining_generations", "generations_remaining"):
+            value = subscription.get(name)
+            if (
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isfinite(float(value))
+            ):
+                return max(0.0, float(value))
+        return None
+
+    @staticmethod
+    def _pixellab_generation_units(
+        width: int,
+        height: int,
+        frame_count: int,
+    ) -> int:
+        """Estimate documented v3 subscription units from total pixel budget."""
+
+        if width <= 0 or height <= 0 or frame_count <= 0:
+            raise ValidationHarnessError("generation dimensions and frame count must be positive")
+        return max(
+            1,
+            math.ceil(
+                width
+                * height
+                * frame_count
+                / PIXELLAB_GENERATION_UNIT_PIXELS
+            ),
+        )
+
+    def estimate_pixellab_generation_units(
+        self,
+        character_id: str,
+        action_id: str,
+        *,
+        candidate_count: int = 1,
+    ) -> dict[str, Any]:
+        if candidate_count < 1 or candidate_count > 8:
+            raise ValidationHarnessError("candidate_count must be between 1 and 8")
+        character, _character_path = self.presets.load_character(character_id)
+        action, _action_path = self.presets.load_action(action_id)
+        per_candidate = self._pixellab_generation_units(
+            character.cell_width,
+            character.cell_height,
+            action.generation_frame_count,
+        )
+        return {
+            "provider": "pixellab",
+            "cell_width": character.cell_width,
+            "cell_height": character.cell_height,
+            "provider_frame_count": action.generation_frame_count,
+            "candidate_count": candidate_count,
+            "generation_units_per_candidate": per_candidate,
+            "maximum_generation_units": per_candidate * candidate_count,
+            "formula": "ceil(width * height * frame_count / 65536)",
+        }
 
     def get_job(self, job_id: str) -> JobRecord:
         return self.store.load(job_id)
@@ -309,6 +434,24 @@ class SpritePipelineService:
     def create_job(self, request: GenerationRequest | dict[str, Any]) -> JobRecord:
         if not isinstance(request, GenerationRequest):
             request = GenerationRequest.model_validate(request)
+        fingerprint_payload = request.model_dump(mode="json", exclude={"request_key"})
+        fingerprint = hashlib.sha256(
+            json.dumps(fingerprint_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        if request.request_key:
+            with self.store.creation_lock():
+                existing = self.store.find_by_request_key(request.request_key)
+                if existing is not None:
+                    if existing.request_fingerprint != fingerprint:
+                        raise ConflictError(
+                            "request key was already used for different generation settings",
+                            details={"request_key": request.request_key, "job_id": existing.job_id},
+                        )
+                    return existing
+                return self._create_job_unlocked(request, fingerprint)
+        return self._create_job_unlocked(request, fingerprint)
+
+    def _create_job_unlocked(self, request: GenerationRequest, fingerprint: str) -> JobRecord:
         character, character_path = self.presets.load_character(request.character_id)
         base_action, action_path = self.presets.load_action(request.action_id)
         updates: dict[str, Any] = {}
@@ -392,10 +535,11 @@ class SpritePipelineService:
             job = JobRecord(
                 job_id=job_id,
                 request=request,
+                request_fingerprint=fingerprint,
                 character=character,
                 action=action,
-                character_preset_path=relative_posix(character_path, self.settings.root),
-                action_preset_path=relative_posix(action_path, self.settings.root),
+                character_preset_path=self.settings.record_path(character_path),
+                action_preset_path=self.settings.record_path(action_path),
                 reference_sha256=sha256_file(reference_dest),
                 input_sha256=input_sha256,
                 full_prompt=full_prompt,
@@ -438,6 +582,7 @@ class SpritePipelineService:
         *,
         source_kind: str = "auto",
         columns: int | None = None,
+        frame_cells: list[tuple[int, int]] | None = None,
     ) -> JobRecord:
         source_path = Path(source).resolve()
         if not source_path.exists():
@@ -448,6 +593,18 @@ class SpritePipelineService:
             and source_path.is_file()
             and source_path.suffix.casefold() != ".gif"
         )
+        if frame_cells is not None and not sheet_kind:
+            raise ValidationHarnessError("frame_cells can only be used with a sprite sheet")
+        try:
+            frame_cells_override = (
+                [(int(column), int(row)) for column, row in frame_cells]
+                if frame_cells is not None
+                else None
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValidationHarnessError("frame_cells must contain column/row pairs") from exc
+        if frame_cells_override == []:
+            raise ValidationHarnessError("frame_cells cannot be empty")
         with self.store.locked_job(job_id) as job:
             candidate = self._candidate(job, candidate_index)
             if job.request.provider != "import":
@@ -483,8 +640,21 @@ class SpritePipelineService:
                 effective_columns = (
                     locked_columns or columns or job.character.sheet_columns
                 ) if sheet_kind else columns
-                frame_cells = job.action.frame_cells if sheet_kind and job.action.sheet_columns else []
-                if sheet_kind and job.action.sheet_rows is not None:
+                contract_frame_cells = (
+                    job.action.frame_cells
+                    if sheet_kind and job.action.sheet_columns
+                    else []
+                )
+                selected_frame_cells = (
+                    frame_cells_override
+                    if frame_cells_override is not None
+                    else contract_frame_cells
+                )
+                if (
+                    sheet_kind
+                    and frame_cells_override is None
+                    and job.action.sheet_rows is not None
+                ):
                     expected_size = (
                         job.character.cell_width * int(effective_columns),
                         job.character.cell_height * job.action.sheet_rows,
@@ -501,11 +671,11 @@ class SpritePipelineService:
                     staging_dir,
                     job.character.cell_width,
                     job.character.cell_height,
-                    len(frame_cells) if frame_cells else None,
+                    len(selected_frame_cells) if selected_frame_cells else None,
                     source_kind=source_kind,
                     columns=effective_columns,
-                    frame_cells=frame_cells or None,
-                    auto_detect_sheet_count=sheet_kind and not frame_cells,
+                    frame_cells=selected_frame_cells or None,
+                    auto_detect_sheet_count=sheet_kind and not selected_frame_cells,
                 )
                 staged_records = [
                     (index, path.name, sha256_file(path)) for index, path in enumerate(staged_paths)
@@ -587,6 +757,8 @@ class SpritePipelineService:
         if job.request.provider == "import":
             raise ValidationHarnessError("import jobs accept frames through ingest, not generate")
         provider = get_provider(job.request.provider, self.settings)
+        self.reconcile_saved_results(job_id)
+        job = self.store.load(job_id)
         if candidate_index is not None:
             targets = [self._candidate(job, candidate_index).candidate_index]
         else:
@@ -595,7 +767,13 @@ class SpritePipelineService:
         pending_other = [
             candidate.candidate_index
             for candidate in job.candidates
-            if candidate.status in (CandidateStatus.submitting, CandidateStatus.provider_pending)
+            if candidate.status
+            in (
+                CandidateStatus.submitting,
+                CandidateStatus.submission_unknown,
+                CandidateStatus.provider_pending,
+                CandidateStatus.saving,
+            )
             and candidate.candidate_index not in targets
         ]
         if pending_other:
@@ -614,17 +792,35 @@ class SpritePipelineService:
                 continue
             if candidate.status == CandidateStatus.failed:
                 continue
-            if candidate.status == CandidateStatus.submitting:
+            if candidate.status in (CandidateStatus.submitting, CandidateStatus.submission_unknown):
                 raise ConflictError(
                     "submission outcome is unknown; automatic resubmission is disabled",
-                    details={"candidate_index": index},
+                    details={
+                        "candidate_index": index,
+                        "provider_job_id": candidate.provider_job_id,
+                        "safe_to_retry": False,
+                    },
                 )
             if candidate.status == CandidateStatus.created:
-                self._submit_candidate(job_id, index, provider)
+                # The browser, REST API, and CLI all share this OS-backed lock.
+                # A live balance check and the only chargeable POST therefore
+                # cannot race one another in separate local processes.
+                with self.store.submission_lock(
+                    timeout_seconds=max(180.0, self.settings.http_timeout_seconds + 60.0)
+                ):
+                    locked_snapshot = self.store.load(job_id)
+                    locked_candidate = self._candidate(locked_snapshot, index)
+                    if locked_candidate.status == CandidateStatus.created:
+                        self._check_submission_quota(job_id, index, provider)
+                        self._submit_candidate(job_id, index, provider)
                 current = self.store.load(job_id)
                 candidate = self._candidate(current, index)
-            if candidate.status != CandidateStatus.provider_pending or not candidate.provider_job_id:
+            if candidate.status not in (CandidateStatus.provider_pending, CandidateStatus.saving) or not candidate.provider_job_id:
                 continue
+            if current.generation_requested_at is None:
+                with self.store.locked_job(job_id) as requested_job:
+                    requested_job.generation_requested_at = utc_now()
+                    requested_job.touch("generation_requested")
             should_wait = wait or provider.diagnostic_only
             self._poll_candidate(job_id, index, provider, wait=should_wait)
             advanced = self._candidate(self.store.load(job_id), index)
@@ -633,6 +829,91 @@ class SpritePipelineService:
             if not wait:
                 break
         return self.store.load(job_id)
+
+    def _check_submission_quota(
+        self,
+        job_id: str,
+        candidate_index: int,
+        provider: Any,
+    ) -> None:
+        """Check and durably record quota immediately before a paid POST."""
+
+        if provider.name != "pixellab" or getattr(provider, "get_balance", None) is None:
+            return
+        snapshot = self._refresh_balance_with_provider(provider)
+        remaining = self._remaining_generations(snapshot)
+        job = self.store.load(job_id)
+        created_candidates = sum(
+            candidate.status == CandidateStatus.created
+            for candidate in job.candidates
+        )
+        candidates_to_reserve = (
+            created_candidates
+            if job.generation_requested_at is None
+            else 1
+        )
+        units_per_candidate = self._pixellab_generation_units(
+            job.character.cell_width,
+            job.character.cell_height,
+            job.action.generation_frame_count,
+        )
+        required_units = units_per_candidate * candidates_to_reserve
+        with self.store.locked_job(job_id) as quota_job:
+            if quota_job.quota_before is None:
+                quota_job.quota_before = snapshot
+            quota_candidate = self._candidate(quota_job, candidate_index)
+            quota_job.touch(
+                "generation_quota_checked",
+                candidate_index=candidate_index,
+                remaining=remaining,
+                requested_candidates=candidates_to_reserve,
+                generation_units_per_candidate=units_per_candidate,
+                requested_generation_units=required_units,
+                chargeable_submission_created=False,
+            )
+            if remaining is not None and required_units > remaining:
+                quota_candidate.error = {
+                    "code": "insufficient_quota",
+                    "message": "not enough PixelLab generations remain",
+                    "details": {
+                        "remaining": remaining,
+                        "requested_candidates": candidates_to_reserve,
+                        "generation_units_per_candidate": units_per_candidate,
+                        "requested_generation_units": required_units,
+                        "submission_created": False,
+                    },
+                }
+                quota_job.status = JobStatus.attention_required
+                quota_job.touch(
+                    "generation_blocked_by_quota",
+                    candidate_index=candidate_index,
+                    remaining=remaining,
+                    requested_candidates=candidates_to_reserve,
+                    generation_units_per_candidate=units_per_candidate,
+                    requested_generation_units=required_units,
+                    chargeable_submission_created=False,
+                )
+            elif (quota_candidate.error or {}).get("code") == "insufficient_quota":
+                quota_candidate.error = None
+                self._refresh_job_status(quota_job)
+                quota_job.touch(
+                    "generation_quota_available",
+                    candidate_index=candidate_index,
+                    remaining=remaining,
+                    chargeable_submission_created=False,
+                )
+        if remaining is not None and required_units > remaining:
+            raise ValidationHarnessError(
+                "not enough PixelLab generation units remain for every requested candidate",
+                details={
+                    "remaining": remaining,
+                    "requested_candidates": candidates_to_reserve,
+                    "generation_units_per_candidate": units_per_candidate,
+                    "requested_generation_units": required_units,
+                    "candidate_index": candidate_index,
+                    "submission_created": False,
+                },
+            )
 
     def recover_completed_candidate(
         self,
@@ -665,7 +946,7 @@ class SpritePipelineService:
             and (candidate.error or {}).get("code")
             in {"provider_contract_error", "provider_frame_storage_error", "validation_error"}
         )
-        if candidate.status != CandidateStatus.provider_pending and not recoverable_failure:
+        if candidate.status not in (CandidateStatus.provider_pending, CandidateStatus.saving) and not recoverable_failure:
             raise ConflictError(
                 "candidate is not a recoverable completed or pending provider job",
                 details={
@@ -717,12 +998,51 @@ class SpritePipelineService:
                     "actual_sha256": actual_reference_sha,
                 },
             )
+        estimated_result_bytes = max(
+            64 * 1024 * 1024,
+            snapshot.character.cell_width
+            * snapshot.character.cell_height
+            * 4
+            * snapshot.action.generation_frame_count
+            * 12,
+        )
+        free_bytes = shutil.disk_usage(self.settings.jobs_dir).free
+        if free_bytes < estimated_result_bytes:
+            raise ValidationHarnessError(
+                "not enough free disk space to safely preserve the provider result",
+                details={
+                    "free_bytes": free_bytes,
+                    "required_headroom_bytes": estimated_result_bytes,
+                },
+            )
         request = ProviderRequest(
             reference_image=reference_bytes,
             prompt=snapshot.full_prompt,
             frame_count=snapshot.action.generation_frame_count,
             seed=snapshot_candidate.seed,
             transparent_background=snapshot.character.transparent_background,
+        )
+        provider_dir = self.store.job_dir(job_id) / "provider"
+        intent_path = provider_dir / f"{snapshot_candidate.candidate_id}.submit.intent.json"
+        atomic_write_json(
+            intent_path,
+            {
+                "schema_version": 1,
+                "job_id": job_id,
+                "candidate_index": candidate_index,
+                "provider": provider.name,
+                "request_key": snapshot.request.request_key,
+                "request_fingerprint": snapshot.request_fingerprint,
+                "reference_sha256": snapshot.reference_sha256,
+                "prompt_sha256": hashlib.sha256(snapshot.full_prompt.encode("utf-8")).hexdigest(),
+                "frame_count": request.frame_count,
+                "seed": request.seed,
+                "transparent_background": request.transparent_background,
+                "created_at": utc_now().isoformat(),
+                "maximum_submission_attempts": 1,
+                "storage_headroom_bytes": free_bytes,
+                "required_storage_headroom_bytes": estimated_result_bytes,
+            },
         )
         with self.store.locked_job(job_id) as job:
             candidate = self._candidate(job, candidate_index)
@@ -732,7 +1052,13 @@ class SpritePipelineService:
                 item.candidate_index
                 for item in job.candidates
                 if item.candidate_index != candidate_index
-                and item.status in (CandidateStatus.submitting, CandidateStatus.provider_pending)
+                and item.status
+                in (
+                    CandidateStatus.submitting,
+                    CandidateStatus.submission_unknown,
+                    CandidateStatus.provider_pending,
+                    CandidateStatus.saving,
+                )
             ]
             if pending_other:
                 raise ConflictError(
@@ -740,9 +1066,15 @@ class SpritePipelineService:
                     details={"candidate_indices": pending_other},
                 )
             candidate.status = CandidateStatus.submitting
+            if job.generation_requested_at is None:
+                job.generation_requested_at = utc_now()
+                job.touch("generation_requested")
+            candidate.submission_started_at = utc_now()
+            candidate.submission_attempts = 1
             candidate.provider_name = provider.name
             candidate.provider_model = "animate-with-text-v3" if provider.name == "pixellab" else "diagnostic-continuity-v2"
-            job.status = JobStatus.provider_pending
+            candidate.raw_request_path = relative_posix(intent_path, self.store.job_dir(job_id))
+            job.status = JobStatus.submitting
             job.touch("candidate_submitting", candidate_index=candidate_index, provider=provider.name)
         try:
             submission = provider.submit(request)
@@ -750,7 +1082,7 @@ class SpritePipelineService:
             with self.store.locked_job(job_id) as failed_job:
                 failed = self._candidate(failed_job, candidate_index)
                 submission_unknown = bool(exc.details.get("submission_unknown"))
-                failed.status = CandidateStatus.submitting if submission_unknown else CandidateStatus.failed
+                failed.status = CandidateStatus.submission_unknown if submission_unknown else CandidateStatus.failed
                 failed.error = exc.as_dict()
                 self._refresh_job_status(failed_job)
                 failed_job.touch(
@@ -759,25 +1091,62 @@ class SpritePipelineService:
                     error=exc.as_dict(),
                 )
             raise
+
+        # Persist the provider ID before optional audit records. Once this save
+        # succeeds, a process crash or page refresh can always resume with GET
+        # and will never need to repeat the chargeable POST.
         with self.store.locked_job(job_id) as submitted_job:
             submitted = self._candidate(submitted_job, candidate_index)
-            provider_dir = self.store.job_dir(job_id) / "provider"
-            request_path = provider_dir / f"{submitted.candidate_id}.submit.request.json"
-            response_path = provider_dir / f"{submitted.candidate_id}.submit.response.json"
-            atomic_write_json(request_path, submission.request_record)
-            atomic_write_json(response_path, submission.raw_response)
-            submitted.raw_request_path = relative_posix(request_path, self.store.job_dir(job_id))
-            submitted.raw_response_path = relative_posix(response_path, self.store.job_dir(job_id))
+            if submitted.status != CandidateStatus.submitting:
+                raise ConflictError(
+                    "candidate changed while provider submission was in flight",
+                    details={"status": submitted.status.value},
+                )
             submitted.provider_job_id = submission.provider_job_id
             submitted.provider_status = submission.status
             submitted.diagnostic_only = submission.diagnostic_only
+            submitted.submitted_at = utc_now()
             submitted.status = CandidateStatus.provider_pending
+            submitted.error = None
             submitted_job.status = JobStatus.provider_pending
             submitted_job.touch(
                 "candidate_submitted",
                 candidate_index=candidate_index,
                 provider_job_id=submission.provider_job_id,
                 diagnostic_only=submission.diagnostic_only,
+            )
+
+        request_path = provider_dir / f"{snapshot_candidate.candidate_id}.submit.request.json"
+        response_path = provider_dir / f"{snapshot_candidate.candidate_id}.submit.response.json"
+        try:
+            atomic_write_json(request_path, submission.request_record)
+            atomic_write_json(response_path, submission.raw_response)
+        except Exception as exc:
+            with self.store.locked_job(job_id) as audit_job:
+                submitted = self._candidate(audit_job, candidate_index)
+                if submitted.provider_job_id == submission.provider_job_id:
+                    submitted.error = {
+                        "code": "submission_audit_write_failed",
+                        "message": "provider job ID is safe, but local audit metadata could not be written",
+                        "details": {"type": type(exc).__name__},
+                    }
+                    audit_job.touch(
+                        "submission_audit_write_failed",
+                        candidate_index=candidate_index,
+                        provider_job_id=submission.provider_job_id,
+                    )
+            return
+
+        with self.store.locked_job(job_id) as audit_job:
+            submitted = self._candidate(audit_job, candidate_index)
+            if submitted.provider_job_id != submission.provider_job_id:
+                return
+            submitted.raw_request_path = relative_posix(request_path, self.store.job_dir(job_id))
+            submitted.raw_response_path = relative_posix(response_path, self.store.job_dir(job_id))
+            audit_job.touch(
+                "candidate_submission_audit_saved",
+                candidate_index=candidate_index,
+                provider_job_id=submission.provider_job_id,
             )
 
     def _poll_candidate(self, job_id: str, candidate_index: int, provider: Any, *, wait: bool) -> None:
@@ -787,7 +1156,7 @@ class SpritePipelineService:
         with self.store.operation_lock(job_id, operation):
             job = self.store.load(job_id)
             candidate = self._candidate(job, candidate_index)
-            if candidate.status != CandidateStatus.provider_pending or not candidate.provider_job_id:
+            if candidate.status not in (CandidateStatus.provider_pending, CandidateStatus.saving) or not candidate.provider_job_id:
                 return
             provider_job_id = candidate.provider_job_id
             candidate_id = candidate.candidate_id
@@ -799,7 +1168,8 @@ class SpritePipelineService:
                     pending = self._candidate(pending_job, candidate_index)
                     if self._is_current_poll_target(pending, provider_job_id):
                         pending.error = exc.as_dict()
-                        pending_job.status = JobStatus.provider_pending
+                        pending.last_polled_at = utc_now()
+                        self._refresh_job_status(pending_job)
                         pending_job.touch("candidate_poll_deferred", candidate_index=candidate_index, error=exc.as_dict())
                         updated = True
                 if wait and updated:
@@ -811,6 +1181,7 @@ class SpritePipelineService:
                     failed = self._candidate(failed_job, candidate_index)
                     if self._is_current_poll_target(failed, provider_job_id):
                         failed.error = exc.as_dict()
+                        failed.last_polled_at = utc_now()
                         failed.status = CandidateStatus.failed
                         self._refresh_job_status(failed_job)
                         failed_job.touch("candidate_poll_failed", candidate_index=candidate_index, error=exc.as_dict())
@@ -820,16 +1191,41 @@ class SpritePipelineService:
                 return
 
             response_path = self.store.job_dir(job_id) / "provider" / f"{candidate_id}.poll.response.json"
-            atomic_write_json(response_path, result.raw_response)
+            response_audit_saved = False
+            response_audit_error: dict[str, Any] | None = None
+            try:
+                atomic_write_json(response_path, result.raw_response)
+                response_audit_saved = True
+            except Exception as exc:
+                # The bounded provider response is useful audit metadata, but a
+                # write failure here must never discard completed paid images
+                # already present in memory.
+                response_audit_error = {
+                    "type": type(exc).__name__,
+                    "message": str(exc),
+                }
             with self.store.locked_job(job_id) as polled_job:
                 polled = self._candidate(polled_job, candidate_index)
                 if not self._is_current_poll_target(polled, provider_job_id):
                     return
-                polled.raw_response_path = relative_posix(response_path, self.store.job_dir(job_id))
+                if response_audit_saved:
+                    polled.raw_response_path = relative_posix(
+                        response_path,
+                        self.store.job_dir(job_id),
+                    )
+                elif response_audit_error is not None:
+                    polled_job.touch(
+                        "poll_audit_write_failed",
+                        candidate_index=candidate_index,
+                        provider_job_id=provider_job_id,
+                        error=response_audit_error,
+                    )
                 polled.provider_status = result.provider_status
+                polled.last_polled_at = utc_now()
                 polled.usage = result.usage
                 polled.error = result.error
                 if result.status == PollStatus.pending:
+                    polled.status = CandidateStatus.provider_pending
                     self._refresh_job_status(polled_job)
                     polled_job.touch("candidate_provider_pending", candidate_index=candidate_index)
                     return
@@ -843,6 +1239,15 @@ class SpritePipelineService:
                         error=result.error,
                     )
                     return
+                polled.status = CandidateStatus.saving
+                polled.provider_completed_at = utc_now()
+                polled.error = None
+                self._refresh_job_status(polled_job)
+                polled_job.touch(
+                    "candidate_provider_completed",
+                    candidate_index=candidate_index,
+                    provider_job_id=provider_job_id,
+                )
 
             try:
                 stored = self._store_provider_frames(
@@ -865,18 +1270,38 @@ class SpritePipelineService:
                 with self.store.locked_job(job_id) as failed_job:
                     failed = self._candidate(failed_job, candidate_index)
                     if self._is_current_poll_target(failed, provider_job_id):
-                        failed.status = CandidateStatus.failed
+                        # The paid provider result may still be downloadable.
+                        # Keep the candidate recoverable and let the background
+                        # worker retry safe GET/storage operations only.
+                        failed.status = CandidateStatus.saving
                         failed.error = error
                         self._refresh_job_status(failed_job)
                         failed_job.touch("provider_frame_storage_failed", candidate_index=candidate_index, error=error)
                 raise
             if stored:
                 self.check_candidate(job_id, candidate_index)
+                if getattr(provider, "get_balance", None) is not None:
+                    try:
+                        quota_after = self._refresh_balance_with_provider(provider)
+                        with self.store.locked_job(job_id) as quota_job:
+                            quota_job.quota_after = quota_after
+                            quota_job.touch(
+                                "generation_quota_refreshed_after_save",
+                                candidate_index=candidate_index,
+                                remaining=self._remaining_generations(quota_after),
+                            )
+                    except Exception as exc:
+                        with self.store.locked_job(job_id) as quota_job:
+                            quota_job.touch(
+                                "generation_quota_refresh_failed_after_save",
+                                candidate_index=candidate_index,
+                                error={"type": type(exc).__name__, "message": str(exc)},
+                            )
 
     @staticmethod
     def _is_current_poll_target(candidate: CandidateRecord, provider_job_id: str) -> bool:
         return (
-            candidate.status == CandidateStatus.provider_pending
+            candidate.status in (CandidateStatus.provider_pending, CandidateStatus.saving)
             and candidate.provider_job_id == provider_job_id
         )
 
@@ -958,6 +1383,7 @@ class SpritePipelineService:
                     {
                         "schema_version": 1,
                         "source_kind": "provider",
+                        "provider_job_id": expected_provider_job_id,
                         "diagnostic_only": diagnostic_only,
                         "provider_frame_count": returned_provider_frame_count,
                         "requested_provider_frame_count": requested_provider_frame_count,
@@ -969,6 +1395,22 @@ class SpritePipelineService:
                         "provider_frame_selection": selection,
                         "provider_source_frames": source_manifest_frames,
                         "frames": manifest_frames,
+                    },
+                )
+                manifest_sha256 = sha256_file(staging_dir / "frames_manifest.json")
+                atomic_write_json(
+                    staging_dir / "result.commit.json",
+                    {
+                        "schema_version": 1,
+                        "job_id": job_id,
+                        "candidate_index": candidate_index,
+                        "provider_job_id": expected_provider_job_id,
+                        "frames_manifest_sha256": manifest_sha256,
+                        "frame_count": len(staged_records),
+                        "frames": [
+                            {"index": index, "filename": filename, "sha256": digest}
+                            for index, filename, digest in staged_records
+                        ],
                     },
                 )
                 if output_dir.exists() and any(output_dir.iterdir()):
@@ -994,7 +1436,23 @@ class SpritePipelineService:
                     os.replace(staging_dir, output_dir)
             except Exception as exc:
                 if staging_dir.exists():
-                    shutil.rmtree(staging_dir, ignore_errors=True)
+                    recovery_root = (
+                        self.settings.recovery_dir
+                        / "incomplete_provider_results"
+                        / job_id
+                    )
+                    try:
+                        recovery_root.mkdir(parents=True, exist_ok=True)
+                        preserved = recovery_root / (
+                            f"{candidate.candidate_id}_{utc_now().strftime('%Y%m%dT%H%M%S%fZ')}"
+                            f"_{secrets.token_hex(4)}"
+                        )
+                        os.replace(staging_dir, preserved)
+                    except Exception:
+                        # Leaving the hidden staging directory in place is safer
+                        # than deleting paid bytes when even recovery storage is
+                        # unavailable.
+                        pass
                 if isinstance(exc, HarnessError):
                     raise
                 raise ValidationHarnessError(
@@ -1008,9 +1466,16 @@ class SpritePipelineService:
             candidate.frames = frames
             candidate.diagnostic_only = diagnostic_only
             candidate.status = CandidateStatus.received
+            candidate.result_manifest_path = relative_posix(
+                output_dir / "frames_manifest.json",
+                self.store.job_dir(job_id),
+            )
+            candidate.result_sha256 = sha256_file(output_dir / "result.commit.json")
+            candidate.result_saved_at = utc_now()
             candidate.qa_completed_at = None
             candidate.qa_input_sha256 = None
             candidate.error = None
+            self._refresh_job_status(job)
             job.touch(
                 "provider_frames_saved",
                 candidate_index=candidate_index,
@@ -1024,6 +1489,521 @@ class SpritePipelineService:
                 diagnostic_only=diagnostic_only,
             )
             return True
+
+    def reconcile_saved_results(self, job_id: str) -> JobRecord:
+        """Adopt a fully written raw result that predates its job.json update.
+
+        The provider result directory is published atomically. A crash in the
+        small interval before the job record save therefore leaves recoverable
+        files on disk; this method verifies and attaches them without calling
+        the provider or consuming another generation.
+        """
+
+        snapshot = self.store.load(job_id)
+        if snapshot.request.provider not in {"pixellab", "fixture"}:
+            return snapshot
+        recoverable_indices: set[int] = set()
+        for candidate in snapshot.candidates:
+            output_dir = self.store.job_dir(job_id) / "raw" / candidate.candidate_id
+            manifest_path = output_dir / "frames_manifest.json"
+            commit_path = output_dir / "result.commit.json"
+            raw_root = output_dir.parent
+            completed_staging_exists = any(
+                path.is_dir() and (path / "result.commit.json").is_file()
+                for path in raw_root.glob(f".{candidate.candidate_id}.*")
+            )
+            if (manifest_path.is_file() or completed_staging_exists) and (
+                not candidate.frames
+                or candidate.result_manifest_path is None
+                or candidate.result_sha256 is None
+                or candidate.result_saved_at is None
+                or not commit_path.is_file()
+                or (
+                    candidate.provider_job_id is not None
+                    and candidate.submission_attempts == 0
+                )
+                or snapshot.generation_requested_at is None
+            ):
+                recoverable_indices.add(candidate.candidate_index)
+        if not recoverable_indices:
+            return snapshot
+        adopted: list[int] = []
+        with self.store.locked_job(job_id) as job:
+            for candidate in job.candidates:
+                if candidate.candidate_index not in recoverable_indices:
+                    continue
+                had_frames = bool(candidate.frames)
+                output_dir = self.store.job_dir(job_id) / "raw" / candidate.candidate_id
+                self._publish_completed_result_staging(job_id, candidate, output_dir)
+                manifest_path = output_dir / "frames_manifest.json"
+                if not manifest_path.is_file():
+                    continue
+                try:
+                    manifest = read_json(manifest_path)
+                    if not isinstance(manifest, dict) or manifest.get("source_kind") != "provider":
+                        continue
+                    manifest_provider_job_id = manifest.get("provider_job_id")
+                    if (
+                        manifest_provider_job_id
+                        and candidate.provider_job_id
+                        and manifest_provider_job_id != candidate.provider_job_id
+                    ):
+                        continue
+                    records = manifest.get("frames")
+                    if not isinstance(records, list) or not records:
+                        continue
+                    frames: list[FrameRecord] = []
+                    commit_frames: list[dict[str, Any]] = []
+                    for expected_index, record in enumerate(records):
+                        if not isinstance(record, dict) or record.get("index") != expected_index:
+                            raise ValidationHarnessError("stored provider frame manifest has invalid indices")
+                        filename = record.get("output_name")
+                        expected_sha = record.get("sha256")
+                        if (
+                            not isinstance(filename, str)
+                            or Path(filename).name != filename
+                            or not isinstance(expected_sha, str)
+                        ):
+                            raise ValidationHarnessError("stored provider frame manifest is invalid")
+                        path = output_dir / filename
+                        actual_sha = sha256_file(path)
+                        if actual_sha != expected_sha:
+                            raise ValidationHarnessError(
+                                "stored provider frame checksum mismatch",
+                                details={"frame_index": expected_index},
+                            )
+                        with Image.open(path) as image:
+                            image.load()
+                            if image.format != "PNG":
+                                raise ValidationHarnessError("stored provider result is not PNG")
+                        relative = relative_posix(path, self.store.job_dir(job_id))
+                        frames.append(
+                            FrameRecord(
+                                index=expected_index,
+                                raw_path=relative,
+                                active_path=relative,
+                                sha256=actual_sha,
+                            )
+                        )
+                        commit_frames.append(
+                            {"index": expected_index, "filename": filename, "sha256": actual_sha}
+                        )
+                    if had_frames:
+                        if len(candidate.frames) != len(frames):
+                            raise ValidationHarnessError(
+                                "stored job frame count does not match its provider manifest"
+                            )
+                        for existing, verified in zip(candidate.frames, frames, strict=True):
+                            if (
+                                existing.index != verified.index
+                                or existing.raw_path != verified.raw_path
+                                or existing.sha256 != verified.sha256
+                            ):
+                                raise ValidationHarnessError(
+                                    "stored job frame record does not match its provider result",
+                                    details={"frame_index": verified.index},
+                                )
+                    commit_path = output_dir / "result.commit.json"
+                    expected_commit = {
+                        "schema_version": 1,
+                        "job_id": job_id,
+                        "candidate_index": candidate.candidate_index,
+                        "provider_job_id": candidate.provider_job_id or manifest_provider_job_id,
+                        "frames_manifest_sha256": sha256_file(manifest_path),
+                        "frame_count": len(frames),
+                        "frames": commit_frames,
+                    }
+                    if commit_path.is_file():
+                        if read_json(commit_path) != expected_commit:
+                            raise ValidationHarnessError("stored provider result commit marker is invalid")
+                    else:
+                        atomic_write_json(commit_path, expected_commit)
+                    result_file_mtimes = [manifest_path.stat().st_mtime]
+                    result_file_mtimes.extend(
+                        (output_dir / item["filename"]).stat().st_mtime
+                        for item in commit_frames
+                    )
+                    verified_saved_at = datetime.fromtimestamp(
+                        max(result_file_mtimes),
+                        tz=timezone.utc,
+                    )
+                    if not had_frames:
+                        candidate.frames = frames
+                    candidate.provider_job_id = candidate.provider_job_id or manifest_provider_job_id
+                    if candidate.provider_job_id:
+                        candidate.submission_attempts = max(
+                            1,
+                            candidate.submission_attempts,
+                        )
+                    candidate.submission_started_at = (
+                        candidate.submission_started_at
+                        or self._job_event_time(
+                            job,
+                            "candidate_submitting",
+                            candidate.candidate_index,
+                        )
+                    )
+                    candidate.submitted_at = (
+                        candidate.submitted_at
+                        or self._job_event_time(
+                            job,
+                            "candidate_submitted",
+                            candidate.candidate_index,
+                        )
+                    )
+                    candidate.provider_status = "completed"
+                    candidate.provider_completed_at = (
+                        candidate.provider_completed_at or verified_saved_at
+                    )
+                    candidate.result_manifest_path = relative_posix(manifest_path, self.store.job_dir(job_id))
+                    candidate.result_sha256 = sha256_file(commit_path)
+                    candidate.result_saved_at = candidate.result_saved_at or verified_saved_at
+                    if job.generation_requested_at is None:
+                        job.generation_requested_at = (
+                            candidate.submission_started_at
+                            or candidate.submitted_at
+                            or candidate.provider_completed_at
+                        )
+                    candidate.diagnostic_only = bool(manifest.get("diagnostic_only", candidate.diagnostic_only))
+                    if not had_frames:
+                        candidate.status = CandidateStatus.received
+                        candidate.error = None
+                        candidate.qa_completed_at = None
+                        candidate.qa_input_sha256 = None
+                        job.touch(
+                            "provider_frames_recovered_from_disk",
+                            candidate_index=candidate.candidate_index,
+                            frame_count=len(frames),
+                            submission_created=False,
+                        )
+                        adopted.append(candidate.candidate_index)
+                    else:
+                        if (candidate.error or {}).get("code") == "stored_result_reconciliation_failed":
+                            candidate.error = None
+                        job.touch(
+                            "provider_result_safety_metadata_upgraded",
+                            candidate_index=candidate.candidate_index,
+                            frame_count=len(frames),
+                            timestamp_source="latest_result_file_mtime",
+                            submission_created=False,
+                        )
+                except Exception as exc:
+                    candidate.error = {
+                        "code": "stored_result_reconciliation_failed",
+                        "message": str(exc),
+                        "details": {"type": type(exc).__name__},
+                    }
+                    candidate.status = CandidateStatus.saving
+                    job.touch(
+                        "stored_result_reconciliation_failed",
+                        candidate_index=candidate.candidate_index,
+                        error=candidate.error,
+                    )
+            self._refresh_job_status(job)
+
+        for candidate_index in adopted:
+            self.check_candidate(job_id, candidate_index)
+        return self.store.load(job_id)
+
+    @staticmethod
+    def _job_event_time(
+        job: JobRecord,
+        event_name: str,
+        candidate_index: int,
+    ) -> datetime | None:
+        for event in reversed(job.events):
+            if (
+                event.get("event") != event_name
+                or event.get("candidate_index") != candidate_index
+            ):
+                continue
+            value = event.get("at")
+            if isinstance(value, datetime):
+                return value
+            if isinstance(value, str):
+                try:
+                    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                    return (
+                        parsed.replace(tzinfo=timezone.utc)
+                        if parsed.tzinfo is None
+                        else parsed
+                    )
+                except ValueError:
+                    return None
+        return None
+
+    def _publish_completed_result_staging(
+        self,
+        job_id: str,
+        candidate: CandidateRecord,
+        output_dir: Path,
+    ) -> bool:
+        """Publish a fully committed pre-rename result left by a hard crash."""
+
+        if output_dir.is_dir() and any(output_dir.iterdir()):
+            return False
+        raw_root = output_dir.parent
+        for staging in sorted(
+            raw_root.glob(f".{candidate.candidate_id}.*"),
+            key=lambda path: path.name,
+        ):
+            if not staging.is_dir():
+                continue
+            try:
+                commit = read_json(staging / "result.commit.json")
+                manifest_path = staging / "frames_manifest.json"
+                manifest = read_json(manifest_path)
+                if (
+                    not isinstance(commit, dict)
+                    or not isinstance(manifest, dict)
+                    or manifest.get("source_kind") != "provider"
+                    or commit.get("job_id") != job_id
+                    or commit.get("candidate_index") != candidate.candidate_index
+                    or commit.get("frames_manifest_sha256") != sha256_file(manifest_path)
+                ):
+                    continue
+                staged_provider_id = commit.get("provider_job_id")
+                if (
+                    candidate.provider_job_id
+                    and staged_provider_id
+                    and candidate.provider_job_id != staged_provider_id
+                ):
+                    continue
+                commit_frames = commit.get("frames")
+                manifest_frames = manifest.get("frames")
+                if (
+                    not isinstance(commit_frames, list)
+                    or not commit_frames
+                    or not isinstance(manifest_frames, list)
+                    or len(commit_frames) != len(manifest_frames)
+                    or commit.get("frame_count") != len(commit_frames)
+                ):
+                    continue
+                valid = True
+                for expected_index, (commit_frame, manifest_frame) in enumerate(
+                    zip(commit_frames, manifest_frames, strict=True)
+                ):
+                    if not isinstance(commit_frame, dict) or not isinstance(manifest_frame, dict):
+                        valid = False
+                        break
+                    filename = commit_frame.get("filename")
+                    digest = commit_frame.get("sha256")
+                    if (
+                        commit_frame.get("index") != expected_index
+                        or manifest_frame.get("index") != expected_index
+                        or manifest_frame.get("output_name") != filename
+                        or manifest_frame.get("sha256") != digest
+                        or not isinstance(filename, str)
+                        or Path(filename).name != filename
+                        or not isinstance(digest, str)
+                        or not re.fullmatch(r"[0-9a-f]{64}", digest)
+                        or sha256_file(staging / filename) != digest
+                    ):
+                        valid = False
+                        break
+                if not valid:
+                    continue
+                if output_dir.exists():
+                    output_dir.rmdir()
+                os.replace(staging, output_dir)
+                return True
+            except Exception:
+                continue
+        return False
+
+    def attach_provider_job_id(
+        self,
+        job_id: str,
+        candidate_index: int,
+        provider_job_id: str,
+    ) -> JobRecord:
+        """Attach a known remote ID after an ambiguous POST; never submit."""
+
+        remote_id = provider_job_id.strip()
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{5,199}", remote_id):
+            raise ValidationHarnessError("provider job ID format is invalid")
+        with self.store.locked_job(job_id) as job:
+            if job.request.provider != "pixellab":
+                raise ValidationHarnessError("manual provider recovery is only available for PixelLab")
+            candidate = self._candidate(job, candidate_index)
+            if candidate.frames:
+                return job
+            if candidate.provider_job_id and candidate.provider_job_id != remote_id:
+                raise ConflictError("candidate already has a different provider job ID")
+            if candidate.status not in (
+                CandidateStatus.submitting,
+                CandidateStatus.submission_unknown,
+                CandidateStatus.provider_pending,
+                CandidateStatus.saving,
+            ):
+                raise ConflictError(
+                    "candidate is not waiting for a recoverable provider job",
+                    details={"status": candidate.status.value},
+                )
+            candidate.provider_job_id = remote_id
+            candidate.provider_status = candidate.provider_status or "processing"
+            candidate.submitted_at = candidate.submitted_at or utc_now()
+            candidate.status = CandidateStatus.provider_pending
+            candidate.error = None
+            job.generation_requested_at = job.generation_requested_at or utc_now()
+            self._refresh_job_status(job)
+            job.touch(
+                "provider_job_id_attached",
+                candidate_index=candidate_index,
+                provider_job_id=remote_id,
+                submission_created=False,
+            )
+        return self.store.load(job_id)
+
+    def recover_pending_jobs(self) -> dict[str, Any]:
+        """Advance every durable live generation using only safe operations."""
+
+        summary: dict[str, Any] = {
+            "checked_at": utc_now().isoformat(),
+            "advanced": [],
+            "attention_required": [],
+            "errors": [],
+        }
+        for row in self.store.list_jobs():
+            job_id = str(row["job_id"])
+            try:
+                job = self.reconcile_saved_results(job_id)
+                if job.request.provider != "pixellab" or job.generation_requested_at is None:
+                    continue
+                stale_before = utc_now() - timedelta(
+                    seconds=max(120.0, self.settings.http_timeout_seconds * 2)
+                )
+                stale_indices = [
+                    candidate.candidate_index
+                    for candidate in job.candidates
+                    if candidate.status == CandidateStatus.submitting
+                    and candidate.provider_job_id is None
+                    and candidate.submission_started_at is not None
+                    and candidate.submission_started_at < stale_before
+                ]
+                if stale_indices:
+                    with self.store.locked_job(job_id) as stale_job:
+                        for index in stale_indices:
+                            candidate = self._candidate(stale_job, index)
+                            if candidate.status != CandidateStatus.submitting or candidate.provider_job_id:
+                                continue
+                            candidate.status = CandidateStatus.submission_unknown
+                            candidate.error = {
+                                "code": "submission_interrupted",
+                                "message": "the process stopped before the provider job ID was saved",
+                                "details": {
+                                    "safe_to_retry": False,
+                                    "manual_provider_job_id_can_recover": True,
+                                },
+                            }
+                            stale_job.touch(
+                                "candidate_submission_marked_unknown",
+                                candidate_index=index,
+                            )
+                        self._refresh_job_status(stale_job)
+                    job = self.store.load(job_id)
+                unknown = [
+                    candidate.candidate_index
+                    for candidate in job.candidates
+                    if candidate.status == CandidateStatus.submission_unknown
+                ]
+                if unknown:
+                    summary["attention_required"].append(
+                        {"job_id": job_id, "candidate_indices": unknown}
+                    )
+                    continue
+                quota_blocked = [
+                    candidate.candidate_index
+                    for candidate in job.candidates
+                    if candidate.status == CandidateStatus.created
+                    and (candidate.error or {}).get("code") == "insufficient_quota"
+                ]
+                if quota_blocked:
+                    summary["attention_required"].append(
+                        {
+                            "job_id": job_id,
+                            "candidate_indices": quota_blocked,
+                            "reason": "insufficient_quota",
+                        }
+                    )
+                active = any(
+                    candidate.status
+                    in (CandidateStatus.provider_pending, CandidateStatus.saving)
+                    for candidate in job.candidates
+                )
+                if not quota_blocked:
+                    active = active or any(
+                        candidate.status == CandidateStatus.created
+                        for candidate in job.candidates
+                    )
+                if active and self.settings.pixellab_api_key:
+                    before_revision = job.revision
+                    advanced = self.generate_job(job_id, wait=False)
+                    if advanced.revision != before_revision:
+                        summary["advanced"].append(
+                            {"job_id": job_id, "status": advanced.status.value}
+                        )
+            except Exception as exc:
+                summary["errors"].append(
+                    {"job_id": job_id, "message": str(exc), "type": type(exc).__name__}
+                )
+        atomic_write_json(self.settings.config_dir / "last_recovery_scan.json", summary)
+        return summary
+
+    def candidate_safety(self, job_id: str, candidate_index: int) -> dict[str, Any]:
+        # This performs disk-only reconciliation. It may attach an already
+        # committed result after a crash, but it never contacts the provider.
+        job = self.reconcile_saved_results(job_id)
+        candidate = self._candidate(job, candidate_index)
+        result_integrity: bool | None = None
+        if candidate.result_manifest_path and candidate.frames:
+            try:
+                manifest = self.store.resolve_job_path(job_id, candidate.result_manifest_path)
+                commit = manifest.parent / "result.commit.json"
+                commit_record = read_json(commit)
+                result_integrity = (
+                    manifest.is_file()
+                    and commit.is_file()
+                    and candidate.result_sha256 == sha256_file(commit)
+                    and isinstance(commit_record, dict)
+                    and commit_record.get("frames_manifest_sha256") == sha256_file(manifest)
+                    and all(
+                        sha256_file(self.store.resolve_job_path(job_id, frame.raw_path)) == frame.sha256
+                        for frame in candidate.frames
+                    )
+                )
+            except Exception:
+                result_integrity = False
+        if candidate.result_saved_at is not None:
+            stage = "saved"
+        elif candidate.status == CandidateStatus.submission_unknown:
+            stage = "submission_unknown"
+        elif candidate.status == CandidateStatus.submitting:
+            stage = "submitting"
+        elif candidate.status == CandidateStatus.provider_pending:
+            stage = "processing"
+        elif candidate.status == CandidateStatus.saving:
+            stage = "saving"
+        elif candidate.status == CandidateStatus.failed:
+            stage = "failed"
+        else:
+            stage = candidate.status.value
+        return {
+            "job_id": job_id,
+            "candidate_index": candidate_index,
+            "stage": stage,
+            "local_task_saved": True,
+            "automatic_resubmission_allowed": False,
+            "submission_attempts": candidate.submission_attempts,
+            "provider_job_id": candidate.provider_job_id,
+            "submission_started_at": candidate.submission_started_at.isoformat() if candidate.submission_started_at else None,
+            "submitted_at": candidate.submitted_at.isoformat() if candidate.submitted_at else None,
+            "last_polled_at": candidate.last_polled_at.isoformat() if candidate.last_polled_at else None,
+            "provider_completed_at": candidate.provider_completed_at.isoformat() if candidate.provider_completed_at else None,
+            "result_saved_at": candidate.result_saved_at.isoformat() if candidate.result_saved_at else None,
+            "result_integrity": result_integrity,
+            "error": candidate.error,
+        }
 
     @staticmethod
     def _atomic_write_bytes(path: Path, payload: bytes) -> None:
@@ -1112,20 +2092,22 @@ class SpritePipelineService:
             thresholds=self._qa_thresholds(job),
         )
         self._apply_qa_report(candidate, report)
-        if job.request.provider != "import" and len(candidate.frames) != job.action.frame_count:
+        if len(candidate.frames) != job.action.frame_count:
+            imported = job.request.provider == "import"
             candidate.warnings.insert(
                 0,
                 QAIssue(
-                    code="provider_frame_count_adjusted",
+                    code="frame_count_mismatch" if imported else "provider_frame_count_adjusted",
                     severity=IssueSeverity.warning,
                     message=(
-                        f"The provider returned {len(candidate.frames)} usable frames; "
-                        f"the action preset expected {job.action.frame_count}. All returned frames were preserved."
+                        f"The {'imported sheet contains' if imported else 'provider returned'} "
+                        f"{len(candidate.frames)} usable frames; the action preset expects "
+                        f"{job.action.frame_count}. All usable frames were preserved for review."
                     ),
                     metrics={
                         "expected": job.action.frame_count,
                         "actual": len(candidate.frames),
-                        "policy": "preserve_all_returned",
+                        "policy": "preserve_all_imported" if imported else "preserve_all_returned",
                     },
                 ),
             )
@@ -1380,6 +2362,253 @@ class SpritePipelineService:
             job.touch("candidate_rejected", candidate_index=candidate_index, reviewer=reviewer, note=note)
         return self.store.load(job_id)
 
+    def get_frame_edit_session(
+        self,
+        job_id: str,
+        candidate_index: int,
+        frame_index: int,
+    ) -> dict[str, Any]:
+        """Return the exact active RGBA pixels used by the browser editor."""
+
+        job = self.store.load(job_id)
+        candidate = self._candidate(job, candidate_index)
+        frame = self._frame(candidate, frame_index)
+        source = self.store.resolve_job_path(job_id, frame.active_path)
+        actual_sha256 = sha256_file(source)
+        if actual_sha256 != frame.sha256:
+            raise ConflictError(
+                "active frame changed outside the recorded job state",
+                details={
+                    "frame_index": frame_index,
+                    "recorded_sha256": frame.sha256,
+                    "actual_sha256": actual_sha256,
+                },
+            )
+        try:
+            with Image.open(source) as opened:
+                opened.load()
+                image = opened.convert("RGBA")
+        except Exception as exc:
+            raise ValidationHarnessError(
+                "active frame cannot be decoded for pixel editing",
+                details={"frame_index": frame_index, "error": str(exc)},
+            ) from exc
+
+        expected_size = (job.character.cell_width, job.character.cell_height)
+        if image.size != expected_size:
+            raise ValidationHarnessError(
+                "active frame has the wrong size for pixel editing",
+                details={"actual": list(image.size), "expected": list(expected_size)},
+            )
+        return {
+            "job_id": job_id,
+            "candidate_index": candidate_index,
+            "frame_index": frame_index,
+            "width": image.width,
+            "height": image.height,
+            "rgba": image.tobytes(),
+            "base_sha256": frame.sha256,
+            "review_status": frame.review_status.value,
+            "can_edit": frame.review_status == ReviewStatus.repair_requested,
+            "manual_edit_versions": frame.manual_edit_versions,
+            "external_repair_attempts": frame.repair_attempts,
+        }
+
+    def edit_frame_pixels(
+        self,
+        job_id: str,
+        candidate_index: int,
+        frame_index: int,
+        *,
+        rgba: bytes,
+        width: int,
+        height: int,
+        base_sha256: str,
+        reviewer: str = "pixel_editor",
+    ) -> JobRecord:
+        """Commit one lossless manual pixel-edit version and re-run QA.
+
+        Manual versions are intentionally separate from the two bounded
+        external/AI replacement attempts. The immutable raw frame is never
+        overwritten.
+        """
+
+        if not isinstance(rgba, bytes):
+            raise ValidationHarnessError("pixel edit payload must be raw RGBA bytes")
+        editor_name = reviewer.strip()
+        if not editor_name or len(editor_name) > 100:
+            raise ValidationHarnessError("pixel editor reviewer must be 1 to 100 characters")
+
+        with self.store.locked_job(job_id) as job:
+            candidate = self._candidate(job, candidate_index)
+            frame = self._frame(candidate, frame_index)
+            expected_size = (job.character.cell_width, job.character.cell_height)
+            actual_size = (int(width), int(height))
+            if actual_size != expected_size:
+                raise ValidationHarnessError(
+                    "pixel edit has the wrong size",
+                    details={"actual": list(actual_size), "expected": list(expected_size)},
+                )
+            expected_bytes = expected_size[0] * expected_size[1] * 4
+            if len(rgba) != expected_bytes:
+                raise ValidationHarnessError(
+                    "pixel edit RGBA byte count is invalid",
+                    details={"actual": len(rgba), "expected": expected_bytes},
+                )
+            if frame.review_status != ReviewStatus.repair_requested:
+                raise ConflictError(
+                    "frame must be explicitly marked repair_requested before pixel editing",
+                    details={"frame_index": frame_index, "review_status": frame.review_status.value},
+                )
+            if frame.sha256 != base_sha256:
+                raise ConflictError(
+                    "pixel edit is based on a stale frame version",
+                    details={
+                        "frame_index": frame_index,
+                        "expected_sha256": frame.sha256,
+                        "received_sha256": base_sha256,
+                    },
+                )
+
+            active_source = self.store.resolve_job_path(job_id, frame.active_path)
+            if sha256_file(active_source) != frame.sha256:
+                raise ConflictError(
+                    "active frame changed outside the recorded job state",
+                    details={"frame_index": frame_index},
+                )
+            try:
+                with Image.open(active_source) as opened:
+                    opened.load()
+                    before = opened.convert("RGBA").tobytes()
+            except Exception as exc:
+                raise ValidationHarnessError(
+                    "active frame cannot be decoded for pixel editing",
+                    details={"frame_index": frame_index, "error": str(exc)},
+                ) from exc
+            if before == rgba:
+                raise ValidationHarnessError(
+                    "pixel edit does not change any pixels",
+                    details={"frame_index": frame_index},
+                )
+
+            changed_pixels: list[int] = []
+            for offset in range(0, expected_bytes, 4):
+                if before[offset : offset + 4] != rgba[offset : offset + 4]:
+                    changed_pixels.append(offset // 4)
+            xs = [index % width for index in changed_pixels]
+            ys = [index // width for index in changed_pixels]
+            changed_bbox = [min(xs), min(ys), max(xs) + 1, max(ys) + 1]
+
+            from .processing._common import atomic_save_png
+
+            version = frame.manual_edit_versions + 1
+            repair_dir = self.store.job_dir(job_id) / "repaired" / candidate.candidate_id
+            destination = repair_dir / f"frame_{frame_index:03d}_manual_v{version:03d}.png"
+            while destination.exists():
+                version += 1
+                destination = repair_dir / f"frame_{frame_index:03d}_manual_v{version:03d}.png"
+            atomic_save_png(Image.frombytes("RGBA", expected_size, rgba), destination)
+            try:
+                with Image.open(destination) as saved:
+                    saved.load()
+                    round_trip = saved.convert("RGBA").tobytes()
+            except Exception:
+                destination.unlink(missing_ok=True)
+                raise
+            if round_trip != rgba:
+                destination.unlink(missing_ok=True)
+                raise ConflictError(
+                    "saved PNG failed exact RGBA round-trip verification",
+                    details={"frame_index": frame_index},
+                )
+
+            saved_sha256 = sha256_file(destination)
+            metadata_path = destination.with_suffix(".meta.json")
+            atomic_write_json(
+                metadata_path,
+                {
+                    "schema_version": 1,
+                    "job_id": job_id,
+                    "candidate_index": candidate_index,
+                    "frame_index": frame_index,
+                    "manual_edit_version": version,
+                    "base_sha256": base_sha256,
+                    "saved_sha256": saved_sha256,
+                    "width": width,
+                    "height": height,
+                    "changed_pixel_count": len(changed_pixels),
+                    "changed_bbox": changed_bbox,
+                    "issue_type": frame.issue_type.value if frame.issue_type else None,
+                    "review_note": frame.review_note,
+                    "reviewer": editor_name,
+                    "created_at": utc_now().isoformat(),
+                },
+            )
+
+            frame.active_path = relative_posix(destination, self.store.job_dir(job_id))
+            frame.sha256 = saved_sha256
+            frame.manual_edit_versions = version
+            frame.review_status = ReviewStatus.pending
+            frame.reviewed_by = None
+            frame.reviewed_at = None
+            frame.review_note = ""
+            candidate.status = CandidateStatus.received
+            candidate.qa_completed_at = None
+            candidate.qa_input_sha256 = None
+            job.status = JobStatus.review_required
+            job.touch(
+                "frame_pixels_edited",
+                candidate_index=candidate_index,
+                frame_index=frame_index,
+                manual_edit_version=version,
+                changed_pixel_count=len(changed_pixels),
+                changed_bbox=changed_bbox,
+                reviewer=editor_name,
+            )
+        return self.check_candidate(job_id, candidate_index)
+
+    def edit_frame_png(
+        self,
+        job_id: str,
+        candidate_index: int,
+        frame_index: int,
+        source: str | Path,
+        *,
+        base_sha256: str | None = None,
+        reviewer: str = "codex",
+    ) -> JobRecord:
+        """Commit a local PNG through the unlimited manual-edit version path."""
+
+        source_path = Path(source).resolve()
+        if not source_path.is_file():
+            raise NotFoundError("pixel edit frame not found", details={"path": str(source_path)})
+        try:
+            with Image.open(source_path) as opened:
+                opened.load()
+                if opened.format != "PNG":
+                    raise ValidationHarnessError("pixel edit frame must be PNG")
+                if "A" not in opened.getbands() and "transparency" not in opened.info:
+                    raise ValidationHarnessError("pixel edit frame must retain source alpha")
+                image = opened.convert("RGBA")
+        except ValidationHarnessError:
+            raise
+        except Exception as exc:
+            raise ValidationHarnessError(
+                "pixel edit frame cannot be decoded",
+                details={"path": str(source_path), "error": str(exc)},
+            ) from exc
+        session = self.get_frame_edit_session(job_id, candidate_index, frame_index)
+        return self.edit_frame_pixels(
+            job_id,
+            candidate_index,
+            frame_index,
+            rgba=image.tobytes(),
+            width=image.width,
+            height=image.height,
+            base_sha256=base_sha256 or str(session["base_sha256"]),
+            reviewer=reviewer,
+        )
+
     def replace_frame(self, job_id: str, candidate_index: int, frame_index: int, source: str | Path) -> JobRecord:
         source_path = Path(source).resolve()
         if not source_path.is_file():
@@ -1556,6 +2785,7 @@ class SpritePipelineService:
                         "reviewed_by": frame.reviewed_by,
                         "reviewed_at": frame.reviewed_at.isoformat() if frame.reviewed_at else None,
                         "repair_attempts": frame.repair_attempts,
+                        "manual_edit_versions": frame.manual_edit_versions,
                         "hard_failures": [item.model_dump(mode="json") for item in frame.hard_failures],
                         "warnings": [item.model_dump(mode="json") for item in frame.warnings],
                     }
@@ -1583,10 +2813,10 @@ class SpritePipelineService:
             job.export = ExportRecord(
                 exported_at=utc_now(),
                 candidate_index=candidate_index,
-                sheet_path=relative_posix(destinations["sheet"], self.settings.root),
-                preview_path=relative_posix(destinations["preview"], self.settings.root),
-                recipe_path=relative_posix(destinations["recipe"], self.settings.root),
-                qa_path=relative_posix(destinations["qa"], self.settings.root),
+                sheet_path=self.settings.record_path(destinations["sheet"]),
+                preview_path=self.settings.record_path(destinations["preview"]),
+                recipe_path=self.settings.record_path(destinations["recipe"]),
+                qa_path=self.settings.record_path(destinations["qa"]),
                 sha256=sha256_file(destinations["sheet"]),
             )
             job.status = JobStatus.exported
@@ -1872,7 +3102,13 @@ class SpritePipelineService:
             job.status = JobStatus.exported
         elif CandidateStatus.approved in statuses:
             job.status = JobStatus.approved
-        elif statuses & {CandidateStatus.submitting, CandidateStatus.provider_pending}:
+        elif CandidateStatus.submission_unknown in statuses:
+            job.status = JobStatus.attention_required
+        elif CandidateStatus.submitting in statuses:
+            job.status = JobStatus.submitting
+        elif CandidateStatus.saving in statuses:
+            job.status = JobStatus.saving
+        elif CandidateStatus.provider_pending in statuses:
             job.status = JobStatus.provider_pending
         elif all(candidate.status in (CandidateStatus.rejected, CandidateStatus.failed) for candidate in job.candidates):
             job.status = JobStatus.failed

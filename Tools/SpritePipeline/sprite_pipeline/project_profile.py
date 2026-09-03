@@ -1,8 +1,9 @@
 """Project-specific sprite contract used by the non-technical web UI.
 
-The attached game manifest is treated as project data. The shared generation
-service still works for custom presets, while this profile locks the verified
-Cyber Warrior filenames, grid shapes, playback order, and runtime timing.
+The attached game manifest provides the verified Cyber Warrior filenames and
+runtime timing. New harness output deliberately standardizes every bundled
+action to sixteen row-major frames in one 4x4 sheet. Existing lower-frame sheets
+remain importable, but are no longer the generation defaults.
 """
 
 from __future__ import annotations
@@ -31,6 +32,8 @@ class ProjectAction:
     critical_frame_indices: tuple[int, ...] = ()
     integration_status: str = "existing"
     note: str = ""
+    legacy_sheet_rows: int | None = None
+    legacy_frame_cells: tuple[tuple[int, int], ...] = ()
 
     @property
     def sheet_size(self) -> tuple[int, int]:
@@ -83,7 +86,7 @@ class ProjectProfile:
 
 
 DREAMWEAVER_PROFILE = ProjectProfile(
-    profile_id="dreamweaver_player_cyber_v2",
+    profile_id="dreamweaver_player_cyber_v3_uniform_16",
     project_name="织梦者",
     display_name="织梦者 / 赛博战士",
     engine="Godot 4.6.2",
@@ -110,28 +113,36 @@ DREAMWEAVER_PROFILE = ProjectProfile(
             4, 4, _row_major_cells(16),
         ),
         ProjectAction(
-            "jump", "jump", "跳跃", "赛博人物跳跃.png", 12, 12, 6, 6, True,
-            4, 3, _row_major_cells(12), (4,),
-            note="下降阶段锁定使用第 5 帧（索引 4）。",
+            "jump", "jump", "跳跃", "赛博人物跳跃.png", 16, 16, 6, 6, True,
+            4, 4, _row_major_cells(16), (12,), integration_status="frame_upgrade",
+            note="新合同的下降关键姿势为第 13 帧（索引 12）；替换旧资产时需要同步 Godot 的下降帧映射。",
+            legacy_sheet_rows=3, legacy_frame_cells=_row_major_cells(12),
         ),
         ProjectAction(
-            "attack", "attack", "地面攻击", "赛博人物攻击.png", 5, 6, 18, 18, False,
-            4, 2, ((0, 0), (2, 0), (1, 1), (2, 1), (3, 1)), (2,),
-            note="项目实际只播放 5 帧；第 3 帧（索引 2）用于蓄力/技能定格。导出保留 3 个透明空格。",
+            "attack", "attack", "地面攻击", "赛博人物攻击.png", 16, 16, 18, 18, False,
+            4, 4, _row_major_cells(16), (6,), integration_status="frame_upgrade",
+            note="新合同使用完整 16 帧；第 7 帧（索引 6）作为蓄力/技能定格姿势，替换旧资产时需要同步 Godot 帧列表。",
+            legacy_sheet_rows=2,
+            legacy_frame_cells=((0, 0), (2, 0), (1, 1), (2, 1), (3, 1)),
         ),
         ProjectAction(
-            "attack_in_air", "attack_in_air", "空中攻击", "赛博人物空中攻击.png", 5, 6, 18, 5, False,
-            4, 3, ((0, 0), (1, 0), (0, 1), (3, 0), (2, 0)),
-            note="资源场景记录为 5 FPS，但当前角色运行时代码强制按 18 FPS 播放；导出遵循运行时 18 FPS。",
+            "attack_in_air", "attack_in_air", "空中攻击", "赛博人物空中攻击.png", 16, 16, 18, 5, False,
+            4, 4, _row_major_cells(16), integration_status="frame_upgrade",
+            note="资源场景记录为 5 FPS，但当前角色运行时代码强制按 18 FPS 播放；新 16 帧资产仍遵循运行时 18 FPS，并需同步 Godot 帧列表。",
+            legacy_sheet_rows=3,
+            legacy_frame_cells=((0, 0), (1, 0), (0, 1), (3, 0), (2, 0)),
         ),
         ProjectAction(
-            "hurt", "hit", "受击", "赛博人物受击.png", 12, 12, 12, 12, True,
-            4, 3, _row_major_cells(12),
+            "hurt", "hit", "受击", "赛博人物受击.png", 16, 16, 12, 12, True,
+            4, 4, _row_major_cells(16), integration_status="frame_upgrade",
+            note="新合同由旧 12 帧升级为 16 帧；替换旧资产时需要同步 Godot 帧列表。",
+            legacy_sheet_rows=3, legacy_frame_cells=_row_major_cells(12),
         ),
         ProjectAction(
-            "backward_evade", "backward_evade", "向后闪避", "赛博人物向后闪避.png", 8, 8, 12, 12, False,
-            4, 2, _row_major_cells(8), integration_status="new",
-            note="新增动作资产：Harness 可生成、检查和导出；当前 Godot 角色状态机尚未接线，替换进工程前需新增动画与状态映射。",
+            "backward_evade", "backward_evade", "向后闪避", "赛博人物向后闪避.png", 16, 16, 12, 12, False,
+            4, 4, _row_major_cells(16), integration_status="new",
+            note="新增 16 帧动作资产：Harness 可生成、检查和导出；当前 Godot 角色状态机尚未接线，替换进工程前需新增动画与状态映射。",
+            legacy_sheet_rows=2, legacy_frame_cells=_row_major_cells(8),
         ),
         ProjectAction(
             "death", "defeated", "失败 / 倒地", "赛博人物失败.png", 16, 16, 12, 12, False,

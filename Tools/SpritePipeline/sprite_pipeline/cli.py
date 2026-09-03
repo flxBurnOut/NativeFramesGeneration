@@ -35,7 +35,10 @@ def _parser() -> argparse.ArgumentParser:
         prog="sprite-harness",
         description="Pixel sprite generation, QA, review, and deterministic export harness.",
     )
-    parser.add_argument("--root", help="Harness data root; defaults to Tools/SpritePipeline.")
+    parser.add_argument(
+        "--root",
+        help="Explicit portable/test root. Omit for separated per-user application data.",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("list-presets", help="List character and action presets.")
@@ -51,6 +54,10 @@ def _parser() -> argparse.ArgumentParser:
     create.add_argument("--frames", type=int)
     create.add_argument("--action-description")
     create.add_argument("--loop", action=argparse.BooleanOptionalAction, default=None)
+    create.add_argument(
+        "--request-key",
+        help="Stable idempotency key; repeating it returns the original job instead of creating another.",
+    )
 
     generate = sub.add_parser("generate", help="Submit/poll provider candidates serially.")
     generate.add_argument("--job", required=True)
@@ -64,8 +71,38 @@ def _parser() -> argparse.ArgumentParser:
     recover.add_argument("--job", required=True)
     recover.add_argument("--candidate", type=int, required=True)
 
+    recover_all = sub.add_parser(
+        "recover-all",
+        help="Safely poll/resume every durable job without repeating a chargeable submission.",
+    )
+
+    attach = sub.add_parser(
+        "attach-provider-job",
+        help="Attach a known PixelLab job ID after an ambiguous submission; never submits.",
+    )
+    attach.add_argument("--job", required=True)
+    attach.add_argument("--candidate", type=int, required=True)
+    attach.add_argument("--provider-job-id", required=True)
+
+    sub.add_parser("balance", help="Refresh and persist the PixelLab account balance.")
+    estimate = sub.add_parser(
+        "estimate",
+        help="Estimate PixelLab generation units without submitting.",
+    )
+    estimate.add_argument("--character", required=True)
+    estimate.add_argument("--action", required=True)
+    estimate.add_argument("--candidates", type=int, default=1)
+    sub.add_parser("storage-status", help="Show separated data paths and migration status.")
+
     status = sub.add_parser("status", help="Return the complete durable job record.")
     status.add_argument("--job", required=True)
+
+    safety = sub.add_parser(
+        "safety",
+        help="Return compact submission and result-integrity status for one candidate.",
+    )
+    safety.add_argument("--job", required=True)
+    safety.add_argument("--candidate", type=int, required=True)
 
     ingest = sub.add_parser("ingest", help="Import a PNG directory, GIF, or sprite sheet candidate.")
     ingest.add_argument("--job", required=True)
@@ -109,6 +146,17 @@ def _parser() -> argparse.ArgumentParser:
     replace.add_argument("--frame", type=int, required=True)
     replace.add_argument("--source", type=Path, required=True)
 
+    pixel_edit = sub.add_parser(
+        "pixel-edit-frame",
+        help="Commit a lossless local PNG as an unlimited manual pixel-edit version.",
+    )
+    pixel_edit.add_argument("--job", required=True)
+    pixel_edit.add_argument("--candidate", type=int, required=True)
+    pixel_edit.add_argument("--frame", type=int, required=True)
+    pixel_edit.add_argument("--source", type=Path, required=True)
+    pixel_edit.add_argument("--base-sha256")
+    pixel_edit.add_argument("--reviewer", default="codex")
+
     export = sub.add_parser("export", help="Export an explicitly approved candidate.")
     export.add_argument("--job", required=True)
     export.add_argument("--candidate", type=int, required=True)
@@ -140,6 +188,13 @@ def _execute(args: argparse.Namespace) -> CommandResult | None:
     if command == "create":
         if args.request:
             request = GenerationRequest.model_validate(read_json(args.request.resolve()))
+            if args.request_key:
+                request = GenerationRequest.model_validate(
+                    {
+                        **request.model_dump(mode="python"),
+                        "request_key": args.request_key,
+                    }
+                )
         else:
             if not args.character or not args.action:
                 raise ValidationHarnessError("create requires --character and --action unless --request is used")
@@ -152,6 +207,7 @@ def _execute(args: argparse.Namespace) -> CommandResult | None:
                 frame_count=args.frames,
                 action_description=args.action_description,
                 loop=args.loop,
+                request_key=args.request_key,
             )
         job = service.create_job(request)
         return CommandResult(operation=command, data={"job": _job_data(job)})
@@ -161,8 +217,37 @@ def _execute(args: argparse.Namespace) -> CommandResult | None:
     if command == "recover":
         job = service.recover_completed_candidate(args.job, args.candidate)
         return CommandResult(operation=command, data={"job": _job_data(job)})
+    if command == "recover-all":
+        return CommandResult(operation=command, data={"recovery": service.recover_pending_jobs()})
+    if command == "attach-provider-job":
+        job = service.attach_provider_job_id(
+            args.job,
+            args.candidate,
+            args.provider_job_id,
+        )
+        return CommandResult(operation=command, data={"job": _job_data(job)})
+    if command == "balance":
+        return CommandResult(operation=command, data={"balance": service.refresh_pixellab_balance()})
+    if command == "estimate":
+        return CommandResult(
+            operation=command,
+            data={
+                "estimate": service.estimate_pixellab_generation_units(
+                    args.character,
+                    args.action,
+                    candidate_count=args.candidates,
+                )
+            },
+        )
+    if command == "storage-status":
+        return CommandResult(operation=command, data=service.storage_status())
     if command == "status":
         return CommandResult(operation=command, data={"job": _job_data(service.get_job(args.job))})
+    if command == "safety":
+        return CommandResult(
+            operation=command,
+            data={"safety": service.candidate_safety(args.job, args.candidate)},
+        )
     if command == "ingest":
         job = service.ingest_candidate(
             args.job,
@@ -198,6 +283,16 @@ def _execute(args: argparse.Namespace) -> CommandResult | None:
         return CommandResult(operation=command, data={"job": _job_data(job)})
     if command == "replace-frame":
         job = service.replace_frame(args.job, args.candidate, args.frame, args.source)
+        return CommandResult(operation=command, data={"job": _job_data(job)})
+    if command == "pixel-edit-frame":
+        job = service.edit_frame_png(
+            args.job,
+            args.candidate,
+            args.frame,
+            args.source,
+            base_sha256=args.base_sha256,
+            reviewer=args.reviewer,
+        )
         return CommandResult(operation=command, data={"job": _job_data(job)})
     if command == "export":
         job = service.export_candidate(

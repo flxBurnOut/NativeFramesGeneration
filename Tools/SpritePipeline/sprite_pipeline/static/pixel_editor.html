@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>精确像素修补画布</title>
+  <link rel="stylesheet" href="/pixel-editor-assets/pixel_editor.css?v=1">
+</head>
+<body>
+  <main class="editor" id="editor">
+    <header class="editor__header">
+      <div>
+        <p class="eyebrow">本地手工修补 · 不消耗 API 次数</p>
+        <h1>精确像素画布</h1>
+      </div>
+      <div class="frame-facts" aria-live="polite">
+        <span id="frameLabel">正在读取画面……</span>
+        <span id="sizeLabel">—</span>
+        <span id="versionLabel">—</span>
+      </div>
+    </header>
+
+    <section class="message message--info" id="message" role="status" aria-live="polite">
+      正在加载当前帧的原始 RGBA 像素……
+    </section>
+
+    <section class="recovery" id="recovery" hidden>
+      <span>发现与当前版本匹配的未保存草稿。</span>
+      <div>
+        <button type="button" id="restoreDraft">恢复草稿</button>
+        <button type="button" id="discardDraft" class="button--quiet">放弃草稿</button>
+      </div>
+    </section>
+
+    <section class="toolbar" aria-label="像素工具">
+      <div class="tool-group" role="group" aria-label="绘画工具">
+        <button type="button" class="tool is-active" data-tool="pencil" aria-pressed="true" title="铅笔（B）">
+          <span aria-hidden="true">✎</span> 铅笔
+        </button>
+        <button type="button" class="tool" data-tool="eraser" aria-pressed="false" title="橡皮擦（E）">
+          <span aria-hidden="true">◇</span> 橡皮擦
+        </button>
+        <button type="button" class="tool" data-tool="eyedropper" aria-pressed="false" title="吸管（I，按住 Alt 可临时使用）">
+          <span aria-hidden="true">⌖</span> 吸管
+        </button>
+      </div>
+
+      <div class="tool-group field-group">
+        <label for="brushSize">笔刷</label>
+        <select id="brushSize" title="方形笔刷尺寸">
+          <option value="1">1×1</option>
+          <option value="2">2×2</option>
+          <option value="3">3×3</option>
+        </select>
+        <label for="colorPicker">颜色</label>
+        <input id="colorPicker" type="color" value="#ffffff" title="当前 RGB 颜色">
+        <label for="alphaInput">A</label>
+        <input id="alphaInput" type="number" min="0" max="255" step="1" value="255" title="Alpha（0–255）">
+      </div>
+
+      <div class="tool-group" role="group" aria-label="历史">
+        <button type="button" id="undoButton" disabled title="撤销（Ctrl+Z）">↶ 撤销</button>
+        <button type="button" id="redoButton" disabled title="重做（Ctrl+Y）">↷ 重做</button>
+      </div>
+
+      <div class="tool-group" role="group" aria-label="视图">
+        <button type="button" id="zoomOut" title="缩小（-）">−</button>
+        <button type="button" id="zoomFit" title="适应窗口">适应</button>
+        <button type="button" id="zoomIn" title="放大（+）">＋</button>
+        <span class="zoom-value" id="zoomValue">—</span>
+        <label class="check-label"><input type="checkbox" id="gridToggle" checked> 网格</label>
+      </div>
+    </section>
+
+    <section class="workspace">
+      <div class="viewport" id="viewport" tabindex="0" aria-label="像素编辑画布">
+        <canvas id="imageCanvas"></canvas>
+        <canvas id="overlayCanvas"></canvas>
+        <div class="loading" id="loading">读取像素中……</div>
+      </div>
+
+      <aside class="inspector">
+        <div class="inspector__block">
+          <h2>当前像素</h2>
+          <dl>
+            <div><dt>坐标</dt><dd id="coordinateValue">—</dd></div>
+            <div><dt>RGBA</dt><dd id="pixelValue">—</dd></div>
+          </dl>
+          <div class="color-preview" id="colorPreview" title="当前绘画颜色"></div>
+          <code id="paintValue">#FFFFFF · A 255</code>
+        </div>
+
+        <div class="inspector__block">
+          <h2>精确规则</h2>
+          <ul>
+            <li>一格就是 PNG 的一个原始像素</li>
+            <li>铅笔直接替换 RGBA，不做抗锯齿</li>
+            <li>橡皮擦写入透明黑色 (0,0,0,0)</li>
+            <li>网格和光标不会写进 PNG</li>
+          </ul>
+        </div>
+
+        <div class="inspector__block shortcuts">
+          <h2>快捷操作</h2>
+          <p><kbd>B</kbd> 铅笔　<kbd>E</kbd> 橡皮擦　<kbd>I</kbd> 吸管</p>
+          <p><kbd>Alt</kbd> 临时吸管　<kbd>G</kbd> 网格</p>
+          <p><kbd>Space</kbd> + 拖动平移　滚轮缩放</p>
+        </div>
+      </aside>
+    </section>
+
+    <footer class="actions">
+      <div>
+        <span class="dirty-indicator" id="dirtyIndicator">尚未修改</span>
+        <button type="button" id="resetButton" class="button--quiet" disabled>放弃本次修改</button>
+      </div>
+      <button type="button" id="saveButton" class="button--primary" disabled>保存为手工修补版本并重新检查</button>
+    </footer>
+  </main>
+  <script type="module" src="/pixel-editor-assets/pixel_editor.js?v=1"></script>
+</body>
+</html>

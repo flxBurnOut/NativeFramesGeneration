@@ -49,10 +49,13 @@ class BackendCapabilityTests(unittest.TestCase):
 
         self.assertIs(configured, True)
         self.assertEqual(service.settings.pixellab_api_key, new_secret)
+        credential_path = self.root / "credentials.json"
+        self.assertTrue(credential_path.is_file())
+        self.assertNotIn(new_secret.encode("utf-8"), credential_path.read_bytes())
         saved = env_path.read_text(encoding="utf-8")
         self.assertEqual(saved.count("PIXELLAB_API_KEY="), 1)
-        self.assertIn(f"PIXELLAB_API_KEY={new_secret}\n", saved)
-        self.assertNotIn(old_secret, saved)
+        self.assertIn(f"PIXELLAB_API_KEY={old_secret}\n", saved)
+        self.assertNotIn(new_secret, saved)
         self.assertIn("PIXELLAB_BASE_URL=https://unit.invalid", saved)
         self.assertIn("CUSTOM_SETTING=keep-me", saved)
         self.assertEqual(SpritePipelineService(self.root).settings.pixellab_api_key, new_secret)
@@ -72,7 +75,9 @@ class BackendCapabilityTests(unittest.TestCase):
         self.assertIs(cleared, False)
         self.assertIsNone(service.settings.pixellab_api_key)
         cleared_text = env_path.read_text(encoding="utf-8")
-        self.assertNotIn("PIXELLAB_API_KEY", cleared_text)
+        # The compatibility source is deliberately left untouched; the
+        # credential tombstone prevents its plaintext key from resurrecting.
+        self.assertIn(f"PIXELLAB_API_KEY={old_secret}\n", cleared_text)
         self.assertNotIn(new_secret, cleared_text)
         self.assertIn("PIXELLAB_BASE_URL=https://unit.invalid", cleared_text)
         self.assertIn("CUSTOM_SETTING=keep-me", cleared_text)
