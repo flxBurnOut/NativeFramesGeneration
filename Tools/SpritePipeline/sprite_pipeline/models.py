@@ -200,6 +200,28 @@ class QAIssue(StrictModel):
     metrics: dict[str, Any] = Field(default_factory=dict)
 
 
+class QAIssueBaseline(StrictModel):
+    """Last successful QA snapshot retained while a repaired frame is rechecked."""
+
+    qa_input_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    qa_algorithm_version: str | None = None
+    qa_completed_at: datetime
+    issues: list[QAIssue] = Field(default_factory=list)
+
+
+class QAChangeSummary(StrictModel):
+    """Stable issue-level delta between the pre-repair and post-repair QA runs."""
+
+    compared_at: datetime
+    baseline_qa_input_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    current_qa_input_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    baseline_qa_algorithm_version: str | None = None
+    current_qa_algorithm_version: str
+    resolved: list[QAIssue] = Field(default_factory=list)
+    new: list[QAIssue] = Field(default_factory=list)
+    persisting: list[QAIssue] = Field(default_factory=list)
+
+
 class ReviewStatus(str, Enum):
     pending = "pending"
     approved = "approved"
@@ -276,6 +298,10 @@ class CandidateRecord(StrictModel):
     warnings: list[QAIssue] = Field(default_factory=list)
     qa_completed_at: datetime | None = None
     qa_input_sha256: str | None = None
+    qa_algorithm_version: str | None = None
+    # Defaults keep job.json files written by earlier harness versions readable.
+    qa_issue_baseline: QAIssueBaseline | None = None
+    qa_change_summary: QAChangeSummary | None = None
     usage: dict[str, Any] = Field(default_factory=dict)
     error: dict[str, Any] | None = None
 

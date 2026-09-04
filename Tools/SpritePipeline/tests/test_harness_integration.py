@@ -22,7 +22,16 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from sprite_pipeline.errors import ConflictError, ExportBlockedError, ValidationHarnessError
-from sprite_pipeline.models import ActionPreset, CandidateStatus, CharacterPreset, IssueType, JobStatus, ReviewStatus
+from sprite_pipeline.models import (
+    ActionPreset,
+    CandidateStatus,
+    CharacterPreset,
+    IssueSeverity,
+    IssueType,
+    JobStatus,
+    QAIssue,
+    ReviewStatus,
+)
 from sprite_pipeline.prompts import compose_generation_prompt
 from sprite_pipeline.processing import build_overlay, run_frame_qa
 from sprite_pipeline.providers.base import (
@@ -33,7 +42,7 @@ from sprite_pipeline.providers.base import (
     redact_provider_payload,
 )
 from sprite_pipeline.providers.pixellab import PixelLabProvider
-from sprite_pipeline.service import SpritePipelineService
+from sprite_pipeline.service import QA_ALGORITHM_VERSION, SpritePipelineService
 from sprite_pipeline.store import JobStore
 
 
@@ -431,6 +440,125 @@ class SpritePipelineIntegrationTests(unittest.TestCase):
         self.assertEqual((jumps[0]["from"], jumps[0]["to"]), (2, 3))
         self.assertEqual((jumps[0]["dx"], jumps[0]["dy"]), (10, 0))
 
+    def test_rigid_position_check_ignores_alpha_below_visibility_threshold(self) -> None:
+        paths = self.harness.write_sequence(
+            self.root / "low_alpha_noise_sequence",
+            shifts=(0, 1, 2, 12),
+        )
+        for path in paths:
+            with Image.open(path) as opened:
+                frame = opened.convert("RGBA").copy()
+            frame.putpixel((1, 1), (255, 0, 255, 1))
+            frame.save(path, format="PNG")
+
+        report = run_frame_qa(
+            paths,
+            expected_count=4,
+            expected_size=(64, 64),
+            thresholds={
+                "alpha_threshold": 1,
+                "rigid_translation_tolerance_px": 2,
+                "centroid_jump_pixels": 20,
+            },
+        )
+
+        self.assertIn(
+            "frame_position_jump",
+            [item["code"] for item in report["hard_failures"]],
+        )
+        self.assertTrue(report["sequence_metrics"]["rigid_translations"])
+        self.assertFalse(report["exportable"])
+
+    def test_loop_endpoint_difference_ignores_alpha_below_visibility_threshold(self) -> None:
+        paths = self.harness.write_sequence(
+            self.root / "loop_low_alpha_noise_sequence",
+            shifts=(0, 1, 0),
+        )
+        with Image.open(paths[0]) as opened:
+            first = opened.convert("RGBA").copy()
+        first.putpixel((1, 1), (255, 0, 255, 1))
+        first.save(paths[0], format="PNG")
+        with Image.open(paths[-1]) as opened:
+            last = opened.convert("RGBA").copy()
+        last.putpixel((2, 1), (0, 255, 255, 1))
+        last.save(paths[-1], format="PNG")
+
+        report = run_frame_qa(
+            paths,
+            expected_count=3,
+            expected_size=(64, 64),
+            loop=True,
+            thresholds={
+                "alpha_threshold": 1,
+                "loop_difference_ratio": 0,
+            },
+        )
+
+        self.assertEqual(
+            report["sequence_metrics"]["loop"]["different_pixels"],
+            0,
+        )
+        self.assertNotIn(
+            "loop_endpoint_difference",
+            [item["code"] for item in report["warnings"]],
+        )
+
+    def test_loop_qa_checks_last_to_first_position_and_velocity(self) -> None:
+        paths = self.harness.write_sequence(
+            self.root / "loop_boundary_sequence",
+            shifts=(0, 1, 2, 3),
+        )
+        report = run_frame_qa(
+            paths,
+            expected_count=4,
+            expected_size=(64, 64),
+            thresholds={
+                "rigid_translation_tolerance_px": 2,
+                "centroid_jump_pixels": 2,
+            },
+            loop=True,
+        )
+
+        rigid_pairs = [
+            (item["from"], item["to"])
+            for item in report["sequence_metrics"]["rigid_translations"]
+        ]
+        centroid_pairs = [
+            (item["from"], item["to"])
+            for item in report["sequence_metrics"]["centroid_pairs"]
+        ]
+        self.assertIn((3, 0), rigid_pairs)
+        self.assertIn((3, 0), centroid_pairs)
+        self.assertTrue(
+            any(
+                item["from"] == 3 and item["to"] == 0
+                for item in report["sequence_metrics"]["position_jumps"]
+            )
+        )
+        self.assertTrue(
+            any(
+                item["code"] == "centroid_jump" and item.get("previous_frame") == 3
+                for item in report["warnings"]
+            )
+        )
+        self.assertTrue(
+            any(
+                item["at"] == 0 and item["to"] == 1
+                for item in report["sequence_metrics"]["centroid_velocity_changes"]
+            )
+        )
+        self.assertTrue(
+            any(
+                item["code"] == "centroid_velocity_jump"
+                and item.get("loop_boundary") is True
+                for item in report["warnings"]
+            )
+        )
+        self.assertTrue(
+            any(item.get("loop_boundary") is True for item in report["hard_failures"])
+        )
+        self.assertFalse(report["exportable"])
+
     def test_overlay_compares_each_frame_with_its_immediate_predecessor(self) -> None:
         paths = self.harness.write_sequence(
             self.root / "overlay_sequence",
@@ -442,7 +570,14 @@ class SpritePipelineIntegrationTests(unittest.TestCase):
 
         self.assertEqual(metadata["comparison_mode"], "adjacent_frames")
         self.assertEqual(metadata["pairs"], [[0, 0], [0, 1], [1, 2], [2, 3]])
+        self.assertFalse(metadata["loop"])
         self.assertTrue(output.is_file())
+
+        loop_output = self.root / "adjacent_overlay_loop.png"
+        loop_metadata = build_overlay(paths, loop_output, scale=2, columns=2, loop=True)
+        self.assertEqual(loop_metadata["pairs"], [[3, 0], [0, 1], [1, 2], [2, 3]])
+        self.assertTrue(loop_metadata["loop"])
+        self.assertTrue(loop_output.is_file())
 
     def test_fixture_create_generate_qa_approve_and_export(self) -> None:
         created = self.service.create_job(self.harness.create_request("fixture"))
@@ -879,6 +1014,30 @@ class SpritePipelineIntegrationTests(unittest.TestCase):
         self.assertEqual([tuple(cell) for cell in recipe["frame_cells"]], cells)
         self.assertEqual([tuple(cell) for cell in recipe["unused_cells"]], [(1, 0), (3, 0), (0, 1)])
 
+    def test_base64_frame_ingest_accepts_17_and_64_frames(self) -> None:
+        frame_path = self.root / "incoming" / "base64_boundary.png"
+        self.harness.write_frame(frame_path, shift_x=0)
+        encoded = base64.b64encode(frame_path.read_bytes()).decode("ascii")
+
+        for frame_count in (17, 64):
+            with self.subTest(frame_count=frame_count):
+                job = self.service.create_job(self.harness.create_request("import"))
+                checked = self.service.ingest_candidate_base64(
+                    job.job_id,
+                    1,
+                    [encoded] * frame_count,
+                )
+                self.assertEqual(len(self._candidate(checked).frames), frame_count)
+
+    def test_base64_frame_ingest_rejects_65_frames(self) -> None:
+        job = self.service.create_job(self.harness.create_request("import"))
+
+        with self.assertRaisesRegex(
+            ValidationHarnessError,
+            "frames must contain between 1 and 64 images",
+        ):
+            self.service.ingest_candidate_base64(job.job_id, 1, [""] * 65)
+
     def test_hard_failure_blocks_frame_and_candidate_approval_and_export(self) -> None:
         source_dir = self.root / "incoming" / "duplicates"
         self.harness.write_sequence(source_dir, shifts=(0, 0, 0, 0))
@@ -1133,6 +1292,58 @@ class SpritePipelineIntegrationTests(unittest.TestCase):
         self.assertEqual(self._candidate(still_approved).status, CandidateStatus.approved)
         self.assertIsNone(self._candidate(still_approved).error)
 
+    def test_old_approved_qa_can_be_rechecked_and_reapproved_before_export(self) -> None:
+        checked = self._ingest_clean_candidate()
+        approved = self.service.approve_candidate(
+            checked.job_id,
+            1,
+            reviewer="integration-test",
+            acknowledge_warnings=True,
+        )
+        with self.service.store.locked_job(approved.job_id) as legacy_job:
+            self._candidate(legacy_job).qa_algorithm_version = "sprite-pipeline-qa-v2"
+
+        rechecked = self.service.check_candidate(approved.job_id, 1)
+        candidate = self._candidate(rechecked)
+        self.assertEqual(candidate.qa_algorithm_version, QA_ALGORITHM_VERSION)
+        self.assertEqual(candidate.status, CandidateStatus.review_ready)
+        self.assertTrue(
+            all(frame.review_status == ReviewStatus.approved for frame in candidate.frames)
+        )
+        self.assertTrue(
+            any(
+                event["event"] == "candidate_approval_invalidated_by_qa_upgrade"
+                for event in rechecked.events
+            )
+        )
+
+        reapproved = self.service.approve_candidate(
+            approved.job_id,
+            1,
+            reviewer="integration-test",
+            acknowledge_warnings=True,
+        )
+        exported = self.service.export_candidate(reapproved.job_id, 1)
+        self.assertIsNotNone(exported.export)
+
+    def test_exported_candidate_cannot_be_rechecked_during_qa_upgrade(self) -> None:
+        checked = self._ingest_clean_candidate()
+        approved = self.service.approve_candidate(
+            checked.job_id,
+            1,
+            reviewer="integration-test",
+            acknowledge_warnings=True,
+        )
+        exported = self.service.export_candidate(approved.job_id, 1)
+        with self.service.store.locked_job(exported.job_id) as legacy_job:
+            self._candidate(legacy_job).qa_algorithm_version = "sprite-pipeline-qa-v2"
+
+        with self.assertRaises(ConflictError):
+            self.service.check_candidate(exported.job_id, 1)
+        persisted = self.service.get_job(exported.job_id)
+        self.assertIsNotNone(persisted.export)
+        self.assertEqual(self._candidate(persisted).status, CandidateStatus.approved)
+
     def test_reference_tampering_after_qa_blocks_approval(self) -> None:
         checked = self._ingest_clean_candidate()
         reference = self.service.store.job_dir(checked.job_id) / "input" / "reference.png"
@@ -1386,7 +1597,13 @@ class SpritePipelineIntegrationTests(unittest.TestCase):
             ConflictError,
             "explicitly marked repair_requested",
         ):
-            self.service.replace_frame(checked.job_id, 1, 0, replacement_paths[0])
+            self.service.replace_frame(
+                checked.job_id,
+                1,
+                0,
+                replacement_paths[0],
+                base_sha256=original.sha256,
+            )
         still_unmarked = self._candidate(self.service.get_job(checked.job_id)).frames[0]
         self.assertEqual(still_unmarked.review_status, ReviewStatus.pending)
         self.assertEqual(still_unmarked.repair_attempts, 0)
@@ -1405,7 +1622,14 @@ class SpritePipelineIntegrationTests(unittest.TestCase):
                     "reviewer": "integration-test",
                 },
             )
-            current = self.service.replace_frame(checked.job_id, 1, 0, replacement)
+            current_sha256 = self._candidate(self.service.get_job(checked.job_id)).frames[0].sha256
+            current = self.service.replace_frame(
+                checked.job_id,
+                1,
+                0,
+                replacement,
+                base_sha256=current_sha256,
+            )
             repaired = self._candidate(current).frames[0]
             self.assertEqual(repaired.repair_attempts, expected_attempt)
             self.assertEqual(repaired.review_status, ReviewStatus.pending)
@@ -1413,7 +1637,13 @@ class SpritePipelineIntegrationTests(unittest.TestCase):
             self.assertIn(f"frame_000_v{expected_attempt}.png", repaired.active_path)
 
         with self.assertRaises(ConflictError):
-            self.service.replace_frame(checked.job_id, 1, 0, replacement_paths[2])
+            self.service.replace_frame(
+                checked.job_id,
+                1,
+                0,
+                replacement_paths[2],
+                base_sha256=self._candidate(current).frames[0].sha256,
+            )
         persisted = self.service.get_job(checked.job_id)
         repaired = self._candidate(persisted).frames[0]
         self.assertEqual(repaired.repair_attempts, 2)
@@ -1423,6 +1653,92 @@ class SpritePipelineIntegrationTests(unittest.TestCase):
         self.assertEqual(
             self.service.store.resolve_job_path(checked.job_id, original_raw_path).read_bytes(),
             original_raw_bytes,
+        )
+
+    def test_external_replacement_rejects_stale_source_version(self) -> None:
+        checked = self._ingest_clean_candidate()
+        original_sha256 = self._candidate(checked).frames[0].sha256
+        replacements = self.root / "incoming" / "stale_replacements"
+        first = replacements / "first.png"
+        stale = replacements / "stale.png"
+        self.harness.write_frame(first, shift_x=4)
+        self.harness.write_frame(stale, shift_x=8)
+        self.service.review_frame(
+            checked.job_id,
+            1,
+            {
+                "frame_index": 0,
+                "status": "repair_requested",
+                "issue_type": IssueType.other.value,
+                "reviewer": "stale-replacement-test",
+            },
+        )
+        first_saved = self.service.replace_frame(
+            checked.job_id,
+            1,
+            0,
+            first,
+            base_sha256=original_sha256,
+        )
+        first_frame = self._candidate(first_saved).frames[0]
+        self.service.review_frame(
+            checked.job_id,
+            1,
+            {
+                "frame_index": 0,
+                "status": "repair_requested",
+                "issue_type": IssueType.other.value,
+                "reviewer": "stale-replacement-test",
+            },
+        )
+        with self.assertRaises(ConflictError) as raised:
+            self.service.replace_frame(
+                checked.job_id,
+                1,
+                0,
+                stale,
+                base_sha256=original_sha256,
+            )
+        self.assertEqual(raised.exception.details["reason"], "stale_frame_version")
+        persisted = self._candidate(self.service.get_job(checked.job_id)).frames[0]
+        self.assertEqual(persisted.sha256, first_frame.sha256)
+        self.assertEqual(persisted.repair_attempts, 1)
+
+    def test_external_replacement_rejects_unrecorded_active_frame_change(self) -> None:
+        checked = self._ingest_clean_candidate()
+        original = self._candidate(checked).frames[0]
+        replacement = self.root / "incoming" / "integrity_replacement.png"
+        self.harness.write_frame(replacement, shift_x=4)
+        self.service.review_frame(
+            checked.job_id,
+            1,
+            {
+                "frame_index": 0,
+                "status": "repair_requested",
+                "issue_type": IssueType.other.value,
+                "reviewer": "integrity-test",
+            },
+        )
+        active_path = self.service.store.resolve_job_path(checked.job_id, original.active_path)
+        self.harness.write_frame(active_path, shift_x=9)
+
+        with self.assertRaises(ConflictError) as raised:
+            self.service.replace_frame(
+                checked.job_id,
+                1,
+                0,
+                replacement,
+                base_sha256=original.sha256,
+            )
+
+        self.assertEqual(
+            raised.exception.details["reason"],
+            "active_frame_integrity_mismatch",
+        )
+        persisted = self._candidate(self.service.get_job(checked.job_id)).frames[0]
+        self.assertEqual(persisted.repair_attempts, 0)
+        self.assertFalse(
+            (self.service.store.job_dir(checked.job_id) / "repaired" / "candidate_01").exists()
         )
 
     def test_manual_pixel_edit_changes_exact_rgba_and_preserves_raw(self) -> None:
@@ -1447,6 +1763,17 @@ class SpritePipelineIntegrationTests(unittest.TestCase):
         session = self.service.get_frame_edit_session(checked.job_id, 1, 0)
         self.assertTrue(session["can_edit"])
         self.assertEqual((session["width"], session["height"]), (64, 64))
+        self.assertEqual(session["frame_count"], 4)
+        self.assertFalse(session["loop"])
+        self.assertEqual(
+            session["alpha_visible_threshold"],
+            checked.character.qa.alpha_visible_threshold,
+        )
+        self.assertIsNone(session["neighbors"]["previous"])
+        self.assertEqual(session["neighbors"]["next"]["frame_index"], 1)
+        next_frame = self._candidate(checked).frames[1]
+        with Image.open(self.service.store.resolve_job_path(checked.job_id, next_frame.active_path)) as opened:
+            self.assertEqual(session["neighbors"]["next"]["rgba"], opened.convert("RGBA").tobytes())
         before = session["rgba"]
         edited = bytearray(before)
         x, y = 7, 9
@@ -1496,6 +1823,444 @@ class SpritePipelineIntegrationTests(unittest.TestCase):
         self.assertEqual(reloaded["rgba"], bytes(edited))
         self.assertFalse(reloaded["can_edit"])
         self.assertEqual(reloaded["manual_edit_versions"], 1)
+
+    def test_manual_pixel_edit_reports_real_stale_conflict_between_two_windows(self) -> None:
+        checked = self._ingest_clean_candidate()
+        self.service.review_frame(
+            checked.job_id,
+            1,
+            {
+                "frame_index": 0,
+                "status": "repair_requested",
+                "issue_type": IssueType.other.value,
+                "reviewer": "window-test",
+            },
+        )
+        first_window = self.service.get_frame_edit_session(checked.job_id, 1, 0)
+        second_window = self.service.get_frame_edit_session(checked.job_id, 1, 0)
+        first_pixels = bytearray(first_window["rgba"])
+        first_pixels[0:4] = bytes((31, 41, 51, 255))
+        saved = self.service.edit_frame_pixels(
+            checked.job_id,
+            1,
+            0,
+            rgba=bytes(first_pixels),
+            width=first_window["width"],
+            height=first_window["height"],
+            base_sha256=first_window["base_sha256"],
+        )
+        self.assertEqual(self._candidate(saved).frames[0].manual_edit_versions, 1)
+
+        second_pixels = bytearray(second_window["rgba"])
+        second_pixels[4:8] = bytes((61, 71, 81, 255))
+        with self.assertRaises(ConflictError) as raised:
+            self.service.edit_frame_pixels(
+                checked.job_id,
+                1,
+                0,
+                rgba=bytes(second_pixels),
+                width=second_window["width"],
+                height=second_window["height"],
+                base_sha256=second_window["base_sha256"],
+            )
+        self.assertEqual(raised.exception.details["reason"], "stale_frame_version")
+        persisted = self.service.get_job(checked.job_id)
+        self.assertEqual(self._candidate(persisted).frames[0].manual_edit_versions, 1)
+
+    def test_pixel_edit_neighbors_wrap_only_for_looping_actions(self) -> None:
+        checked = self._ingest_clean_candidate()
+        non_looping = self.service.get_frame_edit_session(checked.job_id, 1, 0)
+        self.assertIsNone(non_looping["neighbors"]["previous"])
+        with self.service.store.locked_job(checked.job_id) as job:
+            job.action.loop_constraint = "Return smoothly to the first frame."
+            job.action.loop = True
+        looping = self.service.get_frame_edit_session(checked.job_id, 1, 0)
+        self.assertEqual(looping["neighbors"]["previous"]["frame_index"], 3)
+        self.assertEqual(looping["neighbors"]["next"]["frame_index"], 1)
+
+    def test_broken_neighbor_does_not_block_editing_current_frame(self) -> None:
+        checked = self._ingest_clean_candidate()
+        candidate = self._candidate(checked)
+        next_path = self.service.store.resolve_job_path(checked.job_id, candidate.frames[1].active_path)
+        next_path.write_bytes(b"not-a-png")
+
+        session = self.service.get_frame_edit_session(checked.job_id, 1, 0)
+
+        self.assertEqual(len(session["rgba"]), 64 * 64 * 4)
+        self.assertIsNone(session["neighbors"]["next"])
+        self.assertEqual(session["neighbor_warnings"]["next"]["frame_index"], 1)
+        self.assertEqual(
+            session["neighbor_warnings"]["next"]["reason"],
+            "active_frame_integrity_mismatch",
+        )
+
+    def test_rejected_candidate_cannot_be_reopened_or_repaired(self) -> None:
+        checked = self._ingest_clean_candidate()
+        session = self.service.get_frame_edit_session(checked.job_id, 1, 0)
+        self.service.review_frame(
+            checked.job_id,
+            1,
+            {
+                "frame_index": 0,
+                "status": "repair_requested",
+                "issue_type": IssueType.other.value,
+                "reviewer": "terminal-state-test",
+            },
+        )
+        rejected = self.service.reject_candidate(
+            checked.job_id,
+            1,
+            reviewer="terminal-state-test",
+            note="discard this result",
+        )
+        self.assertEqual(self._candidate(rejected).status, CandidateStatus.rejected)
+        self.assertTrue(
+            all(frame.review_status == ReviewStatus.rejected for frame in self._candidate(rejected).frames)
+        )
+        with self.assertRaises(ConflictError) as review_error:
+            self.service.review_frame(
+                checked.job_id,
+                1,
+                {
+                    "frame_index": 0,
+                    "status": "repair_requested",
+                    "issue_type": IssueType.other.value,
+                    "reviewer": "terminal-state-test",
+                },
+            )
+        self.assertEqual(review_error.exception.details["reason"], "terminal_candidate")
+        edited = bytearray(session["rgba"])
+        edited[0:4] = bytes((171, 172, 173, 255))
+        with self.assertRaises(ConflictError) as edit_error:
+            self.service.edit_frame_pixels(
+                checked.job_id,
+                1,
+                0,
+                rgba=bytes(edited),
+                width=session["width"],
+                height=session["height"],
+                base_sha256=session["base_sha256"],
+            )
+        self.assertEqual(edit_error.exception.details["reason"], "terminal_candidate")
+
+    def test_manual_pixel_version_remains_saved_when_automatic_recheck_fails(self) -> None:
+        checked = self._ingest_clean_candidate()
+        self.service.review_frame(
+            checked.job_id,
+            1,
+            {
+                "frame_index": 0,
+                "status": "repair_requested",
+                "issue_type": IssueType.other.value,
+                "reviewer": "qa-failure-test",
+            },
+        )
+        session = self.service.get_frame_edit_session(checked.job_id, 1, 0)
+        edited = bytearray(session["rgba"])
+        edited[0:4] = bytes((101, 102, 103, 255))
+        with patch.object(
+            self.service,
+            "_run_candidate_qa",
+            side_effect=RuntimeError("forced QA failure"),
+        ):
+            saved = self.service.edit_frame_pixels(
+                checked.job_id,
+                1,
+                0,
+                rgba=bytes(edited),
+                width=session["width"],
+                height=session["height"],
+                base_sha256=session["base_sha256"],
+            )
+
+        candidate = self._candidate(saved)
+        frame = candidate.frames[0]
+        self.assertEqual(frame.manual_edit_versions, 1)
+        self.assertEqual(candidate.status, CandidateStatus.check_failed)
+        self.assertEqual(candidate.error["code"], "qa_execution_error")
+        self.assertIn("forced QA failure", candidate.error["message"])
+        active_path = self.service.store.resolve_job_path(saved.job_id, frame.active_path)
+        with Image.open(active_path) as opened:
+            self.assertEqual(opened.convert("RGBA").tobytes(), bytes(edited))
+
+    def test_repair_qa_summary_tracks_resolved_new_and_persisting_issues(self) -> None:
+        checked = self._ingest_clean_candidate()
+        with self.service.store.locked_job(checked.job_id) as job:
+            candidate = self._candidate(job)
+            candidate.hard_failures = [
+                QAIssue(
+                    code="centroid_jump",
+                    severity=IssueSeverity.hard_failure,
+                    message="old jump measurement",
+                    frame_index=1,
+                    metrics={"distance": 20.0},
+                )
+            ]
+            candidate.warnings = [
+                QAIssue(
+                    code="palette_deviation",
+                    severity=IssueSeverity.warning,
+                    message="old palette scope",
+                    frame_index=2,
+                    metrics={"ratio": 0.41},
+                ),
+                QAIssue(
+                    code="consecutive_duplicate_frames",
+                    severity=IssueSeverity.warning,
+                    message="old frame run",
+                    metrics={"frame_indices": [1, 2, 3], "similarity": 0.99},
+                ),
+                QAIssue(
+                    code="frame_position_jump",
+                    severity=IssueSeverity.warning,
+                    message="old transition",
+                    metrics={"from": 0, "to": 1, "dx": 9},
+                ),
+            ]
+
+        self.service.review_frame(
+            checked.job_id,
+            1,
+            {
+                "frame_index": 0,
+                "status": "repair_requested",
+                "issue_type": IssueType.other.value,
+                "reviewer": "qa-delta-test",
+            },
+        )
+        session = self.service.get_frame_edit_session(checked.job_id, 1, 0)
+        edited = bytearray(session["rgba"])
+        edited[0:4] = bytes((111, 112, 113, 255))
+        post_repair_report = {
+            "hard_failures": [
+                {
+                    "code": "centroid_jump",
+                    "message": "new jump measurement",
+                    "frame_index": 1,
+                    "distance": 3.5,
+                }
+            ],
+            "warnings": [
+                {
+                    "code": "palette_deviation",
+                    "message": "same code, new frame scope",
+                    "frame_index": 3,
+                    "ratio": 0.12,
+                },
+                {
+                    "code": "consecutive_duplicate_frames",
+                    "message": "same run with reordered indices",
+                    "frame_indices": [3, 1, 2],
+                    "similarity": 0.73,
+                },
+                {
+                    "code": "frame_position_jump",
+                    "message": "same transition with a lower displacement",
+                    "from": 0,
+                    "to": 1,
+                    "dx": 2,
+                },
+                {
+                    "code": "touches_canvas_edge",
+                    "message": "new issue",
+                    "frame_index": 0,
+                },
+            ],
+            "frames": [],
+        }
+        with patch("sprite_pipeline.processing.run_qa", return_value=post_repair_report):
+            updated = self.service.edit_frame_pixels(
+                checked.job_id,
+                1,
+                0,
+                rgba=bytes(edited),
+                width=session["width"],
+                height=session["height"],
+                base_sha256=session["base_sha256"],
+            )
+
+        candidate = self._candidate(updated)
+        summary = candidate.qa_change_summary
+        self.assertIsNotNone(summary)
+        self.assertIsNone(candidate.qa_issue_baseline)
+        self.assertEqual(
+            {(item.code, item.frame_index) for item in summary.resolved},
+            {("palette_deviation", 2)},
+        )
+        self.assertEqual(
+            {(item.code, item.frame_index) for item in summary.new},
+            {("palette_deviation", 3), ("touches_canvas_edge", 0)},
+        )
+        self.assertEqual(
+            {item.code for item in summary.persisting},
+            {"centroid_jump", "consecutive_duplicate_frames", "frame_position_jump"},
+        )
+        persisted = self.service.get_job(checked.job_id).candidates[0].qa_change_summary
+        self.assertEqual(persisted.model_dump(mode="json"), summary.model_dump(mode="json"))
+
+    def test_external_repair_keeps_qa_baseline_through_failure_and_retry(self) -> None:
+        checked = self._ingest_clean_candidate()
+        with self.service.store.locked_job(checked.job_id) as job:
+            candidate = self._candidate(job)
+            candidate.warnings = [
+                QAIssue(
+                    code="area_change",
+                    severity=IssueSeverity.warning,
+                    message="baseline issue",
+                    frame_index=0,
+                    metrics={"ratio": 0.5},
+                )
+            ]
+        self.service.review_frame(
+            checked.job_id,
+            1,
+            {
+                "frame_index": 0,
+                "status": "repair_requested",
+                "issue_type": IssueType.other.value,
+                "reviewer": "qa-retry-test",
+            },
+        )
+        session = self.service.get_frame_edit_session(checked.job_id, 1, 0)
+        replacement = self.root / "incoming" / "qa_retry_replacement.png"
+        self.harness.write_frame(replacement, shift_x=-1)
+        with patch.object(
+            self.service,
+            "_run_candidate_qa",
+            side_effect=RuntimeError("forced repair QA failure"),
+        ):
+            failed = self.service.replace_frame(
+                checked.job_id,
+                1,
+                0,
+                replacement,
+                base_sha256=session["base_sha256"],
+            )
+
+        failed_candidate = self._candidate(failed)
+        self.assertEqual(failed_candidate.status, CandidateStatus.check_failed)
+        self.assertIsNotNone(failed_candidate.qa_issue_baseline)
+        self.assertIsNone(failed_candidate.qa_change_summary)
+        self.assertEqual(
+            [item.code for item in failed_candidate.qa_issue_baseline.issues],
+            ["area_change"],
+        )
+
+        with patch(
+            "sprite_pipeline.processing.run_qa",
+            return_value={"hard_failures": [], "warnings": [], "frames": []},
+        ):
+            retried = self.service.check_candidate(checked.job_id, 1)
+        retried_candidate = self._candidate(retried)
+        self.assertIsNone(retried_candidate.qa_issue_baseline)
+        self.assertEqual(
+            [item.code for item in retried_candidate.qa_change_summary.resolved],
+            ["area_change"],
+        )
+        self.assertEqual(retried_candidate.qa_change_summary.new, [])
+        self.assertEqual(retried_candidate.qa_change_summary.persisting, [])
+
+    def test_old_job_json_without_qa_change_fields_remains_readable(self) -> None:
+        checked = self._ingest_clean_candidate()
+        job_path = self.service.store.job_dir(checked.job_id) / "job.json"
+        payload = json.loads(job_path.read_text(encoding="utf-8"))
+        for candidate in payload["candidates"]:
+            candidate.pop("qa_issue_baseline", None)
+            candidate.pop("qa_change_summary", None)
+        self.harness._write_json(job_path, payload)
+
+        loaded = self.service.get_job(checked.job_id)
+        self.assertIsNone(loaded.candidates[0].qa_issue_baseline)
+        self.assertIsNone(loaded.candidates[0].qa_change_summary)
+
+    def test_pixel_edit_api_reports_saved_when_automatic_recheck_fails(self) -> None:
+        from fastapi.testclient import TestClient
+
+        from sprite_pipeline.api_app import create_api
+
+        checked = self._ingest_clean_candidate()
+        self.service.review_frame(
+            checked.job_id,
+            1,
+            {
+                "frame_index": 0,
+                "status": "repair_requested",
+                "issue_type": IssueType.other.value,
+                "reviewer": "api-qa-failure-test",
+            },
+        )
+        session = self.service.get_frame_edit_session(checked.job_id, 1, 0)
+        edited = bytearray(session["rgba"])
+        edited[0:4] = bytes((151, 152, 153, 255))
+        with (
+            patch.object(
+                self.service,
+                "_run_candidate_qa",
+                side_effect=RuntimeError("forced API QA failure"),
+            ),
+            TestClient(create_api(self.root, service=self.service)) as client,
+        ):
+            response = client.post(
+                f"/v1/jobs/{checked.job_id}/candidates/1/frames/0/pixel-edit",
+                json={
+                    "width": session["width"],
+                    "height": session["height"],
+                    "rgba_base64": base64.b64encode(edited).decode("ascii"),
+                    "base_sha256": session["base_sha256"],
+                    "reviewer": "api-qa-failure-test",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        edit = response.json()["data"]["edit"]
+        self.assertTrue(edit["saved"])
+        self.assertFalse(edit["qa"]["ok"])
+        self.assertEqual(edit["qa"]["candidate_status"], "check_failed")
+        self.assertEqual(edit["qa"]["error"]["code"], "qa_execution_error")
+        self.assertEqual(
+            self.service.get_job(checked.job_id).candidates[0].frames[0].manual_edit_versions,
+            1,
+        )
+
+    def test_pixel_edit_api_does_not_report_qa_success_when_recheck_never_started(self) -> None:
+        from fastapi.testclient import TestClient
+
+        from sprite_pipeline.api_app import create_api
+
+        checked = self._ingest_clean_candidate()
+        self.service.review_frame(
+            checked.job_id,
+            1,
+            {
+                "frame_index": 0,
+                "status": "repair_requested",
+                "issue_type": IssueType.other.value,
+                "reviewer": "api-precheck-failure-test",
+            },
+        )
+        session = self.service.get_frame_edit_session(checked.job_id, 1, 0)
+        edited = bytearray(session["rgba"])
+        edited[0:4] = bytes((161, 162, 163, 255))
+        with (
+            patch.object(self.service, "check_candidate", side_effect=RuntimeError("failed before QA lock")),
+            TestClient(create_api(self.root, service=self.service)) as client,
+        ):
+            response = client.post(
+                f"/v1/jobs/{checked.job_id}/candidates/1/frames/0/pixel-edit",
+                json={
+                    "width": session["width"],
+                    "height": session["height"],
+                    "rgba_base64": base64.b64encode(edited).decode("ascii"),
+                    "base_sha256": session["base_sha256"],
+                    "reviewer": "api-precheck-failure-test",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        edit = response.json()["data"]["edit"]
+        self.assertTrue(edit["saved"])
+        self.assertFalse(edit["qa"]["ok"])
+        self.assertFalse(edit["qa"]["completed"])
 
     def test_manual_pixel_edits_are_unbounded_and_reject_stale_or_invalid_data(self) -> None:
         current = self._ingest_clean_candidate()
@@ -1586,16 +2351,32 @@ class SpritePipelineIntegrationTests(unittest.TestCase):
                 f"/pixel-editor?job_id={checked.job_id}&candidate=1&frame=0"
             )
             self.assertEqual(page.status_code, 200)
+            self.assertEqual(page.headers["cache-control"], "no-store")
             self.assertIn("精确像素画布", page.text)
-            script = client.get("/pixel-editor-assets/pixel_editor.js?v=1")
+            self.assertIn("精确填充", page.text)
+            self.assertIn("洋葱皮", page.text)
+            self.assertIn("retryLoadButton", page.text)
+            self.assertIn("__spritePixelEditorBoot", page.text)
+            self.assertIn("pixel_editor.css?v=5", page.text)
+            self.assertIn("pixel_editor.js?v=5", page.text)
+            script = client.get("/pixel-editor-assets/pixel_editor.js?v=5")
             self.assertEqual(script.status_code, 200)
+            self.assertEqual(script.headers["cache-control"], "no-store, max-age=0")
             self.assertIn("imageSmoothingEnabled = false", script.text)
+            self.assertIn("submittedPixels", script.text)
 
             response = client.get(
                 f"/v1/jobs/{checked.job_id}/candidates/1/frames/0/pixel-edit"
             )
             self.assertEqual(response.status_code, 200)
             session = response.json()["data"]["session"]
+            self.assertIsNone(session["neighbors"]["previous"])
+            self.assertEqual(session["neighbors"]["next"]["frame_index"], 1)
+            self.assertNotIn("rgba", session["neighbors"]["next"])
+            self.assertEqual(
+                len(base64.b64decode(session["neighbors"]["next"]["rgba_base64"])),
+                session["width"] * session["height"] * 4,
+            )
             pixels = bytearray(base64.b64decode(session["rgba_base64"]))
             pixels[0:4] = bytes((91, 92, 93, 255))
             saved = client.post(
@@ -1609,7 +2390,10 @@ class SpritePipelineIntegrationTests(unittest.TestCase):
                 },
             )
             self.assertEqual(saved.status_code, 200, saved.text)
-            self.assertEqual(saved.json()["data"]["edit"]["manual_edit_versions"], 1)
+            edit = saved.json()["data"]["edit"]
+            self.assertTrue(edit["saved"])
+            self.assertTrue(edit["qa"]["ok"])
+            self.assertEqual(edit["manual_edit_versions"], 1)
 
     def test_codex_cli_can_commit_a_manual_pixel_edit_version(self) -> None:
         checked = self._ingest_clean_candidate()
@@ -1654,6 +2438,36 @@ class SpritePipelineIntegrationTests(unittest.TestCase):
         frame = payload["data"]["job"]["candidates"][0]["frames"][0]
         self.assertEqual(frame["manual_edit_versions"], 1)
         self.assertEqual(frame["repair_attempts"], 0)
+
+    def test_codex_cli_requires_source_frame_sha_for_pixel_edit(self) -> None:
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "sprite_pipeline.cli",
+                "--root",
+                str(self.root),
+                "pixel-edit-frame",
+                "--job",
+                "job-placeholder",
+                "--candidate",
+                "1",
+                "--frame",
+                "0",
+                "--source",
+                str(self.root / "missing.png"),
+            ],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 2)
+        payload = json.loads(completed.stdout.strip())
+        self.assertEqual(payload["error"]["code"], "argument_error")
+        self.assertIn("--base-sha256", payload["error"]["message"])
 
     def test_cli_list_create_status_are_single_line_json_contracts(self) -> None:
         listed = self._run_cli("list-presets")

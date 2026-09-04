@@ -19,6 +19,8 @@ from .settings import HarnessSettings
 
 
 _JOB_ID = re.compile(r"^[0-9]{8}_[a-z0-9_]+_[0-9]{3}$")
+_JOB_SUMMARY_SCHEMA_VERSION = 1
+_JOB_SUMMARY_MAX_BYTES = 128 * 1024
 
 
 class JobStore:
@@ -143,6 +145,96 @@ class JobStore:
                 return job_id, directory
         raise ValidationHarnessError("daily job id space exhausted")
 
+    @staticmethod
+    def _summary_from_job(job: JobRecord) -> dict[str, Any]:
+        terminal_candidates = {"approved", "rejected", "failed"}
+        status_counts: dict[str, int] = {}
+        for candidate in job.candidates:
+            value = candidate.status.value
+            status_counts[value] = status_counts.get(value, 0) + 1
+
+        repair_candidates = [
+            candidate
+            for candidate in job.candidates
+            if candidate.status.value not in terminal_candidates
+            and not (job.export and job.export.candidate_index == candidate.candidate_index)
+            and any(frame.review_status.value == "repair_requested" for frame in candidate.frames)
+        ]
+        active_provider_states = {
+            "submitting",
+            "submission_unknown",
+            "provider_pending",
+            "saving",
+        }
+        needs_recovery = bool(
+            job.request.provider == "pixellab"
+            and job.generation_requested_at is not None
+            and any(
+                candidate.status.value in active_provider_states
+                or (candidate.error or {}).get("code") == "insufficient_quota"
+                or (
+                    candidate.provider_status == "completed"
+                    and bool(candidate.provider_job_id)
+                    and not candidate.frames
+                )
+                for candidate in job.candidates
+            )
+        )
+        return {
+            "summary_schema_version": _JOB_SUMMARY_SCHEMA_VERSION,
+            "job_revision": job.revision,
+            "job_id": job.job_id,
+            "status": job.status.value,
+            "updated_at": job.updated_at.isoformat(),
+            "created_at": job.created_at.isoformat(),
+            "provider": job.request.provider,
+            "character_id": job.character.character_id,
+            "character_name": job.character.display_name,
+            "action_id": job.action.action_id,
+            "action_name": job.action.display_name or job.action.action_id,
+            "generation_requested": job.generation_requested_at is not None,
+            "candidate_count": len(job.candidates),
+            "saved_candidate_count": sum(bool(candidate.frames) for candidate in job.candidates),
+            "total_frame_count": sum(len(candidate.frames) for candidate in job.candidates),
+            "approved_candidate_count": sum(
+                candidate.status.value == "approved" for candidate in job.candidates
+            ),
+            "rejected_candidate_count": sum(
+                candidate.status.value == "rejected" for candidate in job.candidates
+            ),
+            "repair_candidate_count": len(repair_candidates),
+            "repair_frame_count": sum(
+                frame.review_status.value == "repair_requested"
+                for candidate in repair_candidates
+                for frame in candidate.frames
+            ),
+            "candidate_status_counts": status_counts,
+            "exported": job.export is not None,
+            "export_candidate_index": job.export.candidate_index if job.export else None,
+            "needs_recovery": needs_recovery,
+        }
+
+    def _write_summary(self, job: JobRecord) -> None:
+        atomic_write_json(
+            self.job_dir(job.job_id) / "summary.json",
+            self._summary_from_job(job),
+        )
+
+    def _read_summary(self, directory: Path) -> dict[str, Any]:
+        path = directory / "summary.json"
+        if not path.is_file() or path.stat().st_size > _JOB_SUMMARY_MAX_BYTES:
+            raise ValueError("job summary is missing or too large")
+        summary = read_json(path)
+        if (
+            not isinstance(summary, dict)
+            or summary.get("summary_schema_version") != _JOB_SUMMARY_SCHEMA_VERSION
+            or summary.get("job_id") != directory.name
+            or not isinstance(summary.get("status"), str)
+            or not isinstance(summary.get("updated_at"), str)
+        ):
+            raise ValueError("job summary is invalid")
+        return summary
+
     def save(self, job: JobRecord) -> Path:
         with self._lock:
             path = self.job_dir(job.job_id) / "job.json"
@@ -152,6 +244,13 @@ class JobStore:
             history = self.job_dir(job.job_id) / "history" / f"job_{job.revision:08d}.json"
             atomic_write_json(history, job.model_dump(mode="json"))
             atomic_write_json(path, job.model_dump(mode="json"))
+            # summary.json is a disposable, lightweight catalog row. Never let
+            # an index write failure turn a successfully persisted task into an
+            # apparent failure that might encourage a duplicate API submission.
+            try:
+                self._write_summary(job)
+            except OSError:
+                pass
             return path
 
     def load(self, job_id: str) -> JobRecord:
@@ -177,22 +276,36 @@ class JobStore:
                 break
             except (ValidationError, ValueError, OSError, IndexError):
                 continue
+        selected: JobRecord | None = None
         if primary is not None and latest_history is not None:
             # save() publishes the journal before job.json. A crash between
             # those writes leaves a valid but stale current pointer. Selecting
             # the highest durable revision preserves a just-returned provider
             # job ID and prevents an unsafe second POST.
-            return latest_history if latest_history.revision > primary.revision else primary
-        if primary is not None:
-            return primary
-        if latest_history is not None:
-            return latest_history
-        if not path.is_file() and not history_dir.is_dir():
+            selected = latest_history if latest_history.revision > primary.revision else primary
+        elif primary is not None:
+            selected = primary
+        elif latest_history is not None:
+            selected = latest_history
+        elif not path.is_file() and not history_dir.is_dir():
             raise NotFoundError("job not found", details={"job_id": job_id})
-        raise ValidationHarnessError(
-            "job record and its recovery journal are invalid",
-            details={"job_id": job_id, "error": str(primary_error) if primary_error else "no valid revision"},
-        )
+        else:
+            raise ValidationHarnessError(
+                "job record and its recovery journal are invalid",
+                details={"job_id": job_id, "error": str(primary_error) if primary_error else "no valid revision"},
+            )
+
+        # Deep reads repair a missing/stale disposable summary. Normal catalog
+        # listing never reaches this path once summary.json exists.
+        try:
+            if self._read_summary(self.job_dir(job_id)) != self._summary_from_job(selected):
+                self._write_summary(selected)
+        except (OSError, ValueError):
+            try:
+                self._write_summary(selected)
+            except OSError:
+                pass
+        return selected
 
     def find_by_request_key(self, request_key: str) -> JobRecord | None:
         if not request_key:
@@ -235,24 +348,19 @@ class JobStore:
         ]
         for directory in sorted(directories, key=lambda item: item.name, reverse=True):
             try:
-                job = self.load(directory.name)
-                result.append(
-                    {
-                        "job_id": job.job_id,
-                        "status": job.status.value,
-                        "updated_at": job.updated_at.isoformat(),
-                        "created_at": job.created_at.isoformat(),
-                        "provider": job.request.provider,
-                        "character_id": job.character.character_id,
-                        "character_name": job.character.display_name,
-                        "action_id": job.action.action_id,
-                        "action_name": job.action.display_name or job.action.action_id,
-                        "generation_requested": job.generation_requested_at is not None,
-                    }
-                )
+                result.append(self._read_summary(directory))
             except Exception:
-                result.append({"job_id": directory.name, "status": "invalid", "updated_at": ""})
-        return result
+                try:
+                    # One-time compatibility path for tasks created before the
+                    # lightweight catalog existed. load() also backfills it.
+                    result.append(self._summary_from_job(self.load(directory.name)))
+                except Exception:
+                    result.append({"job_id": directory.name, "status": "invalid", "updated_at": ""})
+        return sorted(
+            result,
+            key=lambda row: (str(row.get("updated_at", "")), str(row.get("job_id", ""))),
+            reverse=True,
+        )
 
     @contextmanager
     def locked_job(self, job_id: str) -> Iterator[JobRecord]:
@@ -261,6 +369,11 @@ class JobStore:
         with self._lock:
             with self._process_lock(job_id):
                 job = self.load(job_id)
+                before = job.model_dump(mode="json")
                 yield job
-                job.revision += 1
-                self.save(job)
+                # Read/verify paths also use this context manager. Do not create
+                # an append-only history revision when their observable state
+                # did not change (notably repeated recovery of one bad result).
+                if job.model_dump(mode="json") != before:
+                    job.revision += 1
+                    self.save(job)

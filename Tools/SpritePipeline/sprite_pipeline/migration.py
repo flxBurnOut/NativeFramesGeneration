@@ -28,6 +28,15 @@ def _tree_fingerprints(root: Path) -> list[tuple[str, str]]:
     ]
 
 
+def _job_tree_fingerprints(root: Path) -> list[tuple[str, str]]:
+    """Fingerprint canonical job data while ignoring rebuildable catalog data."""
+    return [
+        (relative, digest)
+        for relative, digest in _tree_fingerprints(root)
+        if relative != "summary.json"
+    ]
+
+
 def _atomic_copy(source: Path, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temp_name = tempfile.mkstemp(
@@ -307,9 +316,10 @@ class LegacyLayoutMigrator:
         area: str,
         report: dict[str, Any],
     ) -> str:
-        source_fingerprints = _tree_fingerprints(source)
+        fingerprints = _job_tree_fingerprints if area == "jobs" else _tree_fingerprints
+        source_fingerprints = fingerprints(source)
         if destination.exists():
-            if destination.is_dir() and source_fingerprints == _tree_fingerprints(destination):
+            if destination.is_dir() and source_fingerprints == fingerprints(destination):
                 report["skipped_identical"] += 1
                 return "identical"
             if (
@@ -331,7 +341,11 @@ class LegacyLayoutMigrator:
         try:
             shutil.rmtree(staging)
             shutil.copytree(source, staging, ignore=shutil.ignore_patterns("*.lock"))
-            if source_fingerprints != _tree_fingerprints(staging):
+            if area == "jobs":
+                # summary.json is a disposable, lightweight catalog projection.
+                # The destination store rebuilds it from the canonical job record.
+                (staging / "summary.json").unlink(missing_ok=True)
+            if source_fingerprints != fingerprints(staging):
                 raise OSError("migration directory checksum mismatch")
             os.replace(staging, destination)
         finally:
@@ -378,8 +392,8 @@ class LegacyLayoutMigrator:
         ):
             return False
 
-        destination_files = dict(_tree_fingerprints(destination))
-        for relative, digest in _tree_fingerprints(source):
+        destination_files = dict(_job_tree_fingerprints(destination))
+        for relative, digest in _job_tree_fingerprints(source):
             if relative == "job.json" or relative.startswith("history/"):
                 continue
             if destination_files.get(relative) != digest:

@@ -50,13 +50,16 @@ portable/test mode.
   jumps, palette deviation, loop closure, and grounded baseline drift.
 - Original/enlarged GIFs, enlarged indexed grid, adjacent-frame onion skins,
   project reference lines, and a preview sheet.
-- Explicit per-frame review, a lossless in-browser pixel editor, unlimited local
-  manual versions, two separately bounded external/future-AI replacements per
-  bad frame, and deterministic staged export.
+- Explicit per-frame review, a full repair timeline with pending, approved,
+  repair-requested, modified, and blocking states, previous/next-problem
+  navigation, a lossless in-browser pixel editor, unlimited local manual
+  versions, two separately bounded external/future-AI replacements per bad
+  frame, and deterministic staged export.
 - Exported PNG, preview GIF, recipe JSON, and QA JSON.
-- A project-guided UI ordered as Guide & Example, Generate Animation, Playback
-  Review, Frame Repair, and Export, with API/project settings last. Character
-  source upload and identity/action prompts are integrated into generation.
+- A project-guided UI with Guide & Example, Generate Animation, a separate
+  Saved Assets library, Playback Review, Frame Repair, Export, and API/project
+  settings. Character source upload and identity/action prompts are integrated
+  into generation.
 - A bundled Dreamweaver / Cyber Warrior profile: 128×128 RGBA cells, four
   columns, anchor (64,106), and a uniform sixteen-frame 4x4 / 512x512 output
   sheet for every new action while retaining project timing and filenames.
@@ -69,9 +72,42 @@ portable/test mode.
 
 PixelLab Edit Animation V2 and GPT-Image-2 automatic repair are intentionally
 not in V0.1. The built-in editor already provides exact RGBA pencil, eraser,
-eyedropper, integer zoom, non-exported pixel grid, pan, undo/redo, crash-recovery
-drafts, and verified manual versions. A repaired PNG can still be inserted with
-the separately bounded `replace-frame` fallback.
+eyedropper, exact four-connected fill, rectangular selection with integer-pixel
+nudge, previous/next onion skins, position deltas, integer zoom, a non-exported
+pixel grid, pan, undo/redo, bounded crash-recovery drafts, and verified manual
+versions. Manual-save and QA status are reported separately, so a durable
+version cannot be misreported as lost when a later preview check fails. A
+repaired PNG can still be inserted with the separately bounded `replace-frame`
+fallback. `replace-frame` also requires the source frame's captured SHA-256, so
+an external editor cannot silently overwrite a newer version.
+
+Drafts retain both the base and edited RGBA buffers. If another window changes
+the durable frame, recovery performs a three-way pixel merge and only applies
+non-conflicting changes; editing stays locked until the recovery choice is
+resolved. Every page instance has an independent draft slot, preventing cloned
+or late-closing tabs from overwriting each other. External replacement uploads
+are likewise bound to the job, candidate, frame, and base SHA-256 captured when
+the file was selected, and are cleared whenever that repair context changes.
+
+Successful QA records its algorithm version. A candidate approved under an
+older QA version may be rechecked before export and must then be approved again;
+an exported candidate remains immutable. The export recipe and QA report both
+record the QA algorithm version.
+
+After a manual or external frame repair, the repair page persists and displays
+an issue delta—resolved, new, and persisting—against the last successful QA.
+If rechecking fails, that baseline remains available for a later retry.
+
+For provider-generated candidates, the immutable source manifest, commit marker,
+and raw PNGs are service-level prerequisites for QA, approval, and export. An
+active repaired frame may differ from its raw source, but cannot hide source
+corruption. Repeated recovery scans of the same persistent error are no-ops and
+do not grow the append-only job journal indefinitely.
+
+Codex may commit a same-size transparent PNG with `pixel-edit-frame`. Its
+`--base-sha256` is mandatory and must be the hash captured when the source
+frame was read, so a stale local edit cannot overwrite a newer UI/API/CLI
+version.
 
 ## Install
 
@@ -212,6 +248,7 @@ Interactive OpenAPI docs are at `http://127.0.0.1:8765/docs`. Main routes:
 | `GET` | `/v1/system/storage` | Separated data paths and migration status |
 | `GET` | `/v1/account/balance` | Refresh the non-chargeable account balance |
 | `GET` | `/v1/account/estimate` | Estimate dynamic generation units locally |
+| `GET` | `/v1/jobs` | Read lightweight saved-task summaries without loading frames or previews |
 | `POST` | `/v1/jobs` | Idempotent create from `GenerationRequest` JSON |
 | `POST` | `/v1/jobs/{id}/generate` | Submit/poll one or all candidates |
 | `GET` | `/v1/jobs/{id}` | Read the durable job record |
@@ -219,7 +256,7 @@ Interactive OpenAPI docs are at `http://127.0.0.1:8765/docs`. Main routes:
 | `POST` | `/v1/recovery/run` | Safely resume all durable tasks |
 | `POST` | `/v1/jobs/{id}/candidates/{n}/recover` | Poll an existing provider job without submitting a generation |
 | `POST` | `/v1/jobs/{id}/candidates/{n}/attach-provider-job` | Bind a known ID after an ambiguous submission |
-| `POST` | `/v1/jobs/{id}/candidates/{n}/frames` | Import base64 PNG frames |
+| `POST` | `/v1/jobs/{id}/candidates/{n}/frames` | Import 1–64 base64 PNG frames |
 | `POST` | `/v1/jobs/{id}/candidates/{n}/reviews/frame` | Save one frame review |
 | `GET` | `/v1/jobs/{id}/candidates/{n}/frames/{frame}/pixel-edit` | Read exact RGBA pixels and the base version hash |
 | `POST` | `/v1/jobs/{id}/candidates/{n}/frames/{frame}/pixel-edit` | Commit a verified manual RGBA version and re-run QA |
@@ -238,26 +275,44 @@ with the same value after a client timeout to receive the original task.
 ```
 
 Open `http://127.0.0.1:7860`. The pages are Guide & Example, Generate Animation,
-Playback Review, Frame Repair, Export, and API & Project.
-The Generate page returns after the durable submit step and shows a four-stage
-task safety center. Closing or refreshing the browser does not stop the local
+Saved Assets, Playback Review, Frame Repair, Export, and API & Project.
+The Generate page returns after the durable submit step. Historical results and
+the four-stage task safety center live in Saved Assets instead of below the
+generation form. Closing or refreshing the browser does not stop the local
 recovery worker; reopening the task shows its saved state.
+
+Startup, the five-second catalog refresh, and changing the task selection read
+only each task's small `summary.json`. Full job history, candidate frames, and
+previews are loaded only after **Open selected task** is pressed. One task owns
+one directory; all of that task's candidates are kept below it as
+`raw/candidate_01`, `candidate_02`, and so on. A missing summary on a legacy task
+is backfilled once from its canonical job record.
 
 Generate Animation accepts the character source PNG, reusable identity prompt,
 and action prompt on one page. A 128×128 single frame is used directly; a
 four-column project Sheet automatically contributes its first visible cell.
 Existing completed Sheets can be uploaded only from Playback Review, where a
 numbered grid is shown before they enter inspection. Frame Repair embeds the
-exact-pixel editor and keeps external PNG upload in a collapsed fallback.
+exact-pixel editor and a full five-state frame timeline. It can jump to the
+previous or next problem frame and preserves the current job, candidate, and
+frame after saves, rechecks, and external replacements. For looping actions,
+the last frame is the first frame's “loop previous” neighbor and the first frame
+is the last frame's “loop next” neighbor. External PNG upload remains a
+collapsed, provenance-bound fallback.
 The diagnostic dummy appears only under Example.
 
 ## Tests
 
-Core tests use `unittest` and do not make paid or network calls:
+The unified pytest entry runs the Python suite and, when Node.js is installed,
+the pure pixel-editor core suite. Tests do not make paid or network calls:
 
 ```powershell
-python -m unittest discover -s tests -v
+python -m pytest -q
 ```
+
+The real-browser smoke test—load, draw exact pixels, undo/redo, save, reload,
+and byte-compare the result—has not yet been run. Python/Node regression tests
+must not be reported as a passed browser smoke test.
 
 The offline fixture proves storage, QA, review, and export plumbing. A real
 model feasibility run with project characters is still required before treating

@@ -34,6 +34,12 @@ On Windows, use `harness.cmd` when PowerShell execution policy blocks
    export.
 8. Report the four paths and sheet checksum from `data.job.export`.
 
+`list-jobs` is intentionally a lightweight catalog command. It reads each
+task's `summary.json` and does not load frames, previews, or the full journal.
+After selecting a `job_id`, use `status --job <id>` for the complete durable
+record. All candidates created by one request remain under that single task
+directory.
+
 For the bundled Cyber Warrior, use action IDs `idle`, `walk`, `jump`, `attack`,
 `attack_in_air`, `hurt`, `backward_evade`, or `death`. Do not reconstruct sheet
 order yourself: every new bundled action requests sixteen frames and exports a
@@ -66,6 +72,38 @@ Candidate states are `created`, `submitting`, `submission_unknown`,
 - `review_ready` requires explicit review/approval.
 - `fixture` results are diagnostic only even if QA passes.
 
+Every successful QA run records `qa_algorithm_version`. If `safety` or `status`
+shows a candidate approved under an older algorithm and it has not been
+exported, run `check --job <id> --candidate <n>`, inspect the new report, and
+approve it again. Never treat the old approval as current. Exported candidates
+are immutable and cannot be rechecked as part of an algorithm migration. The
+export recipe and QA JSON preserve the version used for the decision.
+
+## Frame-repair state and browser drafts
+
+The operator page shows every candidate frame in one timeline with five visual
+states: pending, approved, repair requested, modified, and still blocking. It
+can move directly to the previous or next problem frame and keeps the selected
+job, candidate, and frame after a save or recheck. Loop endpoints use each
+other as actual neighbors; do not analyze the first and last frame as unrelated
+when the action is cyclic.
+
+After a repair is checked successfully, `qa_change_summary` records resolved,
+new, and persisting issues relative to the preceding successful QA. A failed QA
+keeps `qa_issue_baseline` for a safe retry; do not clear or reinterpret that
+baseline as a successful comparison.
+
+Browser drafts store base RGBA plus edited RGBA. When the durable frame changes,
+the editor performs a three-way merge and only accepts non-conflicting pixels;
+editing remains disabled until recovery is resolved. Draft slots are unique per
+page instance, so multiple windows must not be assumed to share one draft.
+
+For external `replace-frame`, the selected file is bound to its job, candidate,
+frame, and source SHA-256. Changing repair context invalidates the upload. Codex
+must follow the same rule: keep the target identifiers and SHA captured when the
+source was read, and require the operator to reselect/recreate the file after a
+context change instead of applying it to a different frame.
+
 ## Stable examples
 
 Create from flags with an idempotency key:
@@ -89,11 +127,21 @@ Mark a bad frame and commit a local pixel-edit PNG:
 .\harness.ps1 pixel-edit-frame --job <id> --candidate 1 --frame 5 --source D:\repairs\frame_005.png --base-sha256 <current-frame-sha256> --reviewer codex
 ```
 
-`--base-sha256` prevents a stale edit from overwriting a frame changed in
-another UI/API session. It may be omitted for a one-shot local operation, in
-which case the service reads the current hash immediately before committing.
+`--base-sha256` is required. It prevents a PNG prepared from an older frame
+from overwriting a newer version saved by another UI/API/CLI session. Always
+carry forward the hash returned when the source pixels were read; never query
+a fresh hash only at commit time.
 The command verifies an exact RGBA PNG round trip, preserves the immutable raw
 frame, records changed-pixel metadata, and re-runs QA.
+
+The bounded external `replace-frame` fallback also requires
+`--base-sha256 <hash-captured-when-the-frame-was-selected>` for the same
+double-window protection.
+
+Base64 frame ingestion accepts 1–64 PNG frames and retains the aggregate upload
+limit. Provider candidates additionally require an intact immutable result
+manifest, commit marker, and raw frames before QA, approval, or export; repaired
+active versions never bypass this gate.
 
 Reject a candidate without modifying its immutable raw frames:
 

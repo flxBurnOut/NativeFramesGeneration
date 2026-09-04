@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>精确像素修补画布</title>
-  <link rel="stylesheet" href="/pixel-editor-assets/pixel_editor.css?v=1">
+  <link rel="stylesheet" href="/pixel-editor-assets/pixel_editor.css?v=5">
 </head>
 <body>
   <main class="editor" id="editor">
@@ -21,13 +21,15 @@
     </header>
 
     <section class="message message--info" id="message" role="status" aria-live="polite">
-      正在加载当前帧的原始 RGBA 像素……
+      <span id="messageText">正在启动像素画布……</span>
+      <button type="button" id="retryLoadButton" class="button--quiet message__retry" hidden>重新读取</button>
     </section>
 
     <section class="recovery" id="recovery" hidden>
-      <span>发现与当前版本匹配的未保存草稿。</span>
+      <span id="recoveryText">发现与当前版本匹配的未保存草稿。</span>
       <div>
         <button type="button" id="restoreDraft">恢复草稿</button>
+        <button type="button" id="downloadDraft" class="button--quiet">下载精确备份</button>
         <button type="button" id="discardDraft" class="button--quiet">放弃草稿</button>
       </div>
     </section>
@@ -42,6 +44,12 @@
         </button>
         <button type="button" class="tool" data-tool="eyedropper" aria-pressed="false" title="吸管（I，按住 Alt 可临时使用）">
           <span aria-hidden="true">⌖</span> 吸管
+        </button>
+        <button type="button" class="tool" data-tool="fill" aria-pressed="false" title="精确填充（F）">
+          <span aria-hidden="true">▣</span> 填充
+        </button>
+        <button type="button" class="tool" data-tool="select" aria-pressed="false" title="矩形框选（M）">
+          <span aria-hidden="true">▧</span> 框选
         </button>
       </div>
 
@@ -63,12 +71,32 @@
         <button type="button" id="redoButton" disabled title="重做（Ctrl+Y）">↷ 重做</button>
       </div>
 
+      <div class="tool-group selection-tools" role="group" aria-label="选区操作">
+        <button type="button" id="selectOpaque" title="框选当前所有可见像素">角色范围</button>
+        <button type="button" id="nudgeLeft" class="square-button" disabled title="选区向左移动 1 像素（←）">←</button>
+        <button type="button" id="nudgeUp" class="square-button" disabled title="选区向上移动 1 像素（↑）">↑</button>
+        <button type="button" id="nudgeDown" class="square-button" disabled title="选区向下移动 1 像素（↓）">↓</button>
+        <button type="button" id="nudgeRight" class="square-button" disabled title="选区向右移动 1 像素（→）">→</button>
+        <button type="button" id="clearSelectionPixels" disabled title="把框内像素清为透明（Delete）">清空框内</button>
+        <button type="button" id="cancelSelection" disabled title="取消框选（Esc）">取消框选</button>
+      </div>
+
       <div class="tool-group" role="group" aria-label="视图">
         <button type="button" id="zoomOut" title="缩小（-）">−</button>
+        <button type="button" id="zoomOne" title="恢复 PNG 原始 1:1 尺寸">1:1</button>
         <button type="button" id="zoomFit" title="适应窗口">适应</button>
         <button type="button" id="zoomIn" title="放大（+）">＋</button>
         <span class="zoom-value" id="zoomValue">—</span>
         <label class="check-label"><input type="checkbox" id="gridToggle" checked> 网格</label>
+      </div>
+
+      <div class="tool-group onion-controls" role="group" aria-label="相邻帧洋葱皮">
+        <span class="group-label">洋葱皮</span>
+        <label class="check-label onion-previous"><input type="checkbox" id="previousToggle" checked> 前一帧</label>
+        <label class="check-label onion-next"><input type="checkbox" id="nextToggle" checked> 后一帧</label>
+        <label for="onionOpacity">浓度</label>
+        <input id="onionOpacity" type="range" min="10" max="70" step="5" value="35">
+        <span class="zoom-value" id="onionOpacityValue">35%</span>
       </div>
     </section>
 
@@ -91,19 +119,35 @@
         </div>
 
         <div class="inspector__block">
+          <h2>本次修改</h2>
+          <dl>
+            <div><dt>变化像素</dt><dd id="changedPixelValue">0</dd></div>
+            <div><dt>变化范围</dt><dd id="changedBoundsValue">—</dd></div>
+            <div><dt>当前选区</dt><dd id="selectionValue">—</dd></div>
+            <div><dt>角色范围</dt><dd id="currentBoundsValue">—</dd></div>
+            <div><dt>前帧 → 当前</dt><dd id="previousDeltaValue">—</dd></div>
+            <div><dt>当前 → 后帧</dt><dd id="nextDeltaValue">—</dd></div>
+          </dl>
+          <p class="helper-text">方向键只会把选区移动整数像素；触碰外框时会停止，不会偷偷裁掉内容。</p>
+        </div>
+
+        <div class="inspector__block">
           <h2>精确规则</h2>
           <ul>
             <li>一格就是 PNG 的一个原始像素</li>
             <li>铅笔直接替换 RGBA，不做抗锯齿</li>
             <li>橡皮擦写入透明黑色 (0,0,0,0)</li>
-            <li>网格和光标不会写进 PNG</li>
+            <li>网格、选区和洋葱皮不会写进 PNG</li>
+            <li>填充只匹配四向连通且 RGBA 完全相同的像素</li>
           </ul>
         </div>
 
         <div class="inspector__block shortcuts">
           <h2>快捷操作</h2>
-          <p><kbd>B</kbd> 铅笔　<kbd>E</kbd> 橡皮擦　<kbd>I</kbd> 吸管</p>
-          <p><kbd>Alt</kbd> 临时吸管　<kbd>G</kbd> 网格</p>
+          <p><kbd>B</kbd> 铅笔　<kbd>E</kbd> 橡皮　<kbd>I</kbd> 吸管</p>
+          <p><kbd>F</kbd> 填充　<kbd>M</kbd> 框选　<kbd>G</kbd> 网格</p>
+          <p><kbd>方向键</kbd> 移动选区　<kbd>Delete</kbd> 清空框内</p>
+          <p><kbd>Alt</kbd> 临时吸管　<kbd>Esc</kbd> 取消框选</p>
           <p><kbd>Space</kbd> + 拖动平移　滚轮缩放</p>
         </div>
       </aside>
@@ -117,6 +161,74 @@
       <button type="button" id="saveButton" class="button--primary" disabled>保存为手工修补版本并重新检查</button>
     </footer>
   </main>
-  <script type="module" src="/pixel-editor-assets/pixel_editor.js?v=1"></script>
+  <script>
+    (() => {
+      const loading = document.querySelector("#loading");
+      const message = document.querySelector("#message");
+      const messageText = document.querySelector("#messageText");
+      const retry = document.querySelector("#retryLoadButton");
+      let started = false;
+      let finished = false;
+      let watchdog = null;
+
+      const showFailure = (text) => {
+        finished = true;
+        window.clearTimeout(watchdog);
+        loading.hidden = true;
+        messageText.textContent = text;
+        message.className = "message message--error";
+        retry.hidden = false;
+      };
+      const armWatchdog = () => {
+        window.clearTimeout(watchdog);
+        watchdog = window.setTimeout(() => {
+          showFailure(started
+            ? "像素画布启动超时。请重新读取；若仍失败，请重启本地服务。"
+            : "像素编辑器资源未能载入，可能仍在使用旧缓存。请重新读取。"
+          );
+        }, 20000);
+      };
+
+      window.__spritePixelEditorBoot = {
+        markStarted() {
+          started = true;
+          finished = false;
+          loading.hidden = false;
+          loading.textContent = "正在读取原始 RGBA 像素……";
+          armWatchdog();
+        },
+        markReady() {
+          finished = true;
+          window.clearTimeout(watchdog);
+        },
+        markFailed() {
+          finished = true;
+          window.clearTimeout(watchdog);
+        },
+      };
+      retry.addEventListener("click", () => {
+        retry.hidden = true;
+        if (typeof window.__spritePixelEditorRetry === "function") {
+          window.__spritePixelEditorRetry();
+          return;
+        }
+        const freshUrl = new URL(window.location.href);
+        freshUrl.searchParams.set("editor_reload", Date.now().toString());
+        window.location.replace(freshUrl);
+      });
+      window.addEventListener("error", () => {
+        if (!finished) {
+          showFailure("像素编辑器脚本启动失败。请重新读取；若刚刚更新过工具，请重启本地服务。");
+        }
+      });
+      window.addEventListener("unhandledrejection", () => {
+        if (!finished) {
+          showFailure("像素编辑器启动时发生异常。请重新读取；当前图片没有被修改。");
+        }
+      });
+      armWatchdog();
+    })();
+  </script>
+  <script type="module" src="/pixel-editor-assets/pixel_editor.js?v=5"></script>
 </body>
 </html>

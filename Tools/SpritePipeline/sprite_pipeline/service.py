@@ -43,7 +43,9 @@ from .models import (
     IssueSeverity,
     JobRecord,
     JobStatus,
+    QAChangeSummary,
     QAIssue,
+    QAIssueBaseline,
     ReviewStatus,
     utc_now,
 )
@@ -53,7 +55,7 @@ from .settings import HarnessSettings
 from .store import JobStore
 
 
-QA_ALGORITHM_VERSION = "sprite-pipeline-qa-v2"
+QA_ALGORITHM_VERSION = "sprite-pipeline-qa-v3"
 PIXELLAB_GENERATION_UNIT_PIXELS = 64 * 64 * 16
 
 
@@ -83,7 +85,7 @@ class SpritePipelineService:
             "actions": self.presets.list_actions(),
         }
 
-    def list_jobs(self) -> list[dict[str, str]]:
+    def list_jobs(self) -> list[dict[str, Any]]:
         return self.store.list_jobs()
 
     def create_character_preset(
@@ -697,6 +699,7 @@ class SpritePipelineService:
             candidate.status = CandidateStatus.received
             candidate.qa_completed_at = None
             candidate.qa_input_sha256 = None
+            candidate.qa_algorithm_version = None
             candidate.error = None
             job.touch(
                 "candidate_ingested",
@@ -715,8 +718,8 @@ class SpritePipelineService:
         """Ingest API-friendly base64 PNG frames through the same immutable path."""
 
         job = self.store.load(job_id)
-        if not frames or len(frames) > 16:
-            raise ValidationHarnessError("frames must contain between 1 and 16 images")
+        if not frames or len(frames) > 64:
+            raise ValidationHarnessError("frames must contain between 1 and 64 images")
         total_encoded = sum(len(value) for value in frames if isinstance(value, str))
         max_encoded = ((self.settings.max_download_bytes + 2) // 3) * 4 + 16
         if total_encoded > max_encoded:
@@ -1474,6 +1477,7 @@ class SpritePipelineService:
             candidate.result_saved_at = utc_now()
             candidate.qa_completed_at = None
             candidate.qa_input_sha256 = None
+            candidate.qa_algorithm_version = None
             candidate.error = None
             self._refresh_job_status(job)
             job.touch(
@@ -1597,7 +1601,10 @@ class SpritePipelineService:
                             if (
                                 existing.index != verified.index
                                 or existing.raw_path != verified.raw_path
-                                or existing.sha256 != verified.sha256
+                                or (
+                                    existing.active_path == existing.raw_path
+                                    and existing.sha256 != verified.sha256
+                                )
                             ):
                                 raise ValidationHarnessError(
                                     "stored job frame record does not match its provider result",
@@ -1670,6 +1677,7 @@ class SpritePipelineService:
                         candidate.error = None
                         candidate.qa_completed_at = None
                         candidate.qa_input_sha256 = None
+                        candidate.qa_algorithm_version = None
                         job.touch(
                             "provider_frames_recovered_from_disk",
                             candidate_index=candidate.candidate_index,
@@ -1680,29 +1688,49 @@ class SpritePipelineService:
                     else:
                         if (candidate.error or {}).get("code") == "stored_result_reconciliation_failed":
                             candidate.error = None
+                        recovered_from_saving = candidate.status == CandidateStatus.saving
+                        if recovered_from_saving:
+                            candidate.status = CandidateStatus.received
+                            candidate.qa_completed_at = None
+                            candidate.qa_input_sha256 = None
+                            candidate.qa_algorithm_version = None
+                            adopted.append(candidate.candidate_index)
                         job.touch(
                             "provider_result_safety_metadata_upgraded",
                             candidate_index=candidate.candidate_index,
                             frame_count=len(frames),
                             timestamp_source="latest_result_file_mtime",
+                            recovered_from_saving=recovered_from_saving,
                             submission_created=False,
                         )
                 except Exception as exc:
-                    candidate.error = {
+                    next_error = {
                         "code": "stored_result_reconciliation_failed",
                         "message": str(exc),
                         "details": {"type": type(exc).__name__},
                     }
-                    candidate.status = CandidateStatus.saving
-                    job.touch(
-                        "stored_result_reconciliation_failed",
-                        candidate_index=candidate.candidate_index,
-                        error=candidate.error,
-                    )
+                    error_changed = candidate.error != next_error
+                    status_changed = not had_frames and candidate.status != CandidateStatus.saving
+                    if error_changed:
+                        candidate.error = next_error
+                    if status_changed:
+                        candidate.status = CandidateStatus.saving
+                    if error_changed or status_changed:
+                        job.touch(
+                            "stored_result_reconciliation_failed",
+                            candidate_index=candidate.candidate_index,
+                            error=candidate.error,
+                        )
             self._refresh_job_status(job)
 
         for candidate_index in adopted:
-            self.check_candidate(job_id, candidate_index)
+            try:
+                self.check_candidate(job_id, candidate_index)
+            except Exception:
+                # check_candidate persists its own recoverable QA error. One
+                # broken candidate must not prevent later recovered candidates
+                # in the same task from being checked.
+                continue
         return self.store.load(job_id)
 
     @staticmethod
@@ -1865,6 +1893,11 @@ class SpritePipelineService:
             "errors": [],
         }
         for row in self.store.list_jobs():
+            # Completed assets are represented by summary.json and are opened
+            # lazily by the UI. Only unfinished/attention tasks need a deep
+            # reconciliation pass in the background worker.
+            if not bool(row.get("needs_recovery")):
+                continue
             job_id = str(row["job_id"])
             try:
                 job = self.reconcile_saved_results(job_id)
@@ -1950,6 +1983,110 @@ class SpritePipelineService:
         atomic_write_json(self.settings.config_dir / "last_recovery_scan.json", summary)
         return summary
 
+    def _committed_result_integrity(
+        self,
+        job_id: str,
+        candidate: CandidateRecord,
+    ) -> bool:
+        if not candidate.result_manifest_path or not candidate.frames:
+            return False
+        job_dir = self.store.job_dir(job_id)
+        manifest_path = self.store.resolve_job_path(job_id, candidate.result_manifest_path)
+        commit_path = manifest_path.parent / "result.commit.json"
+        if not manifest_path.is_file() or not commit_path.is_file():
+            return False
+        manifest_record = read_json(manifest_path)
+        commit_record = read_json(commit_path)
+        if (
+            not isinstance(manifest_record, dict)
+            or manifest_record.get("source_kind") != "provider"
+            or not isinstance(commit_record, dict)
+            or commit_record.get("job_id") != job_id
+            or commit_record.get("candidate_index") != candidate.candidate_index
+            or candidate.result_sha256 != sha256_file(commit_path)
+            or commit_record.get("frames_manifest_sha256") != sha256_file(manifest_path)
+        ):
+            return False
+        manifest_frames = manifest_record.get("frames")
+        commit_frames = commit_record.get("frames")
+        if (
+            not isinstance(manifest_frames, list)
+            or not isinstance(commit_frames, list)
+            or len(manifest_frames) != len(commit_frames)
+            or len(commit_frames) != len(candidate.frames)
+            or commit_record.get("frame_count") != len(commit_frames)
+        ):
+            return False
+        current_frames = {frame.index: frame for frame in candidate.frames}
+        if len(current_frames) != len(candidate.frames):
+            return False
+        for expected_index, (manifest_frame, commit_frame) in enumerate(
+            zip(manifest_frames, commit_frames, strict=True)
+        ):
+            if not isinstance(manifest_frame, dict) or not isinstance(commit_frame, dict):
+                return False
+            filename = commit_frame.get("filename")
+            expected_sha = commit_frame.get("sha256")
+            if (
+                commit_frame.get("index") != expected_index
+                or manifest_frame.get("index") != expected_index
+                or manifest_frame.get("output_name") != filename
+                or manifest_frame.get("sha256") != expected_sha
+                or not isinstance(filename, str)
+                or Path(filename).name != filename
+                or not isinstance(expected_sha, str)
+            ):
+                return False
+            raw_path = manifest_path.parent / filename
+            current_frame = current_frames.get(expected_index)
+            if (
+                current_frame is None
+                or current_frame.raw_path != relative_posix(raw_path, job_dir)
+                or sha256_file(raw_path) != expected_sha
+            ):
+                return False
+        return True
+
+    def _assert_committed_result_integrity(
+        self,
+        job_id: str,
+        job: JobRecord,
+        candidate: CandidateRecord,
+        *,
+        error_class: type[HarnessError],
+    ) -> None:
+        """Require the immutable provider result before QA, approval or export.
+
+        A repaired active frame may intentionally differ from its raw frame.
+        This gate verifies only the original provider manifest, commit marker,
+        and raw PNG bytes, so local edits remain usable without hiding loss of
+        the paid source result.
+        """
+
+        if job.request.provider == "import":
+            return
+        verification_error: Exception | None = None
+        try:
+            intact = self._committed_result_integrity(job_id, candidate)
+        except Exception as exc:
+            intact = False
+            verification_error = exc
+        if intact:
+            return
+        details: dict[str, Any] = {
+            "candidate_index": candidate.candidate_index,
+            "provider": job.request.provider,
+            "result_integrity": False,
+        }
+        if candidate.error:
+            details["candidate_error"] = candidate.error
+        if verification_error is not None:
+            details["verification_error"] = str(verification_error)
+        raise error_class(
+            "stored provider result failed integrity verification; QA, approval and export are blocked",
+            details=details,
+        )
+
     def candidate_safety(self, job_id: str, candidate_index: int) -> dict[str, Any]:
         # This performs disk-only reconciliation. It may attach an already
         # committed result after a crash, but it never contacts the provider.
@@ -1958,20 +2095,7 @@ class SpritePipelineService:
         result_integrity: bool | None = None
         if candidate.result_manifest_path and candidate.frames:
             try:
-                manifest = self.store.resolve_job_path(job_id, candidate.result_manifest_path)
-                commit = manifest.parent / "result.commit.json"
-                commit_record = read_json(commit)
-                result_integrity = (
-                    manifest.is_file()
-                    and commit.is_file()
-                    and candidate.result_sha256 == sha256_file(commit)
-                    and isinstance(commit_record, dict)
-                    and commit_record.get("frames_manifest_sha256") == sha256_file(manifest)
-                    and all(
-                        sha256_file(self.store.resolve_job_path(job_id, frame.raw_path)) == frame.sha256
-                        for frame in candidate.frames
-                    )
-                )
+                result_integrity = self._committed_result_integrity(job_id, candidate)
             except Exception:
                 result_integrity = False
         if candidate.result_saved_at is not None:
@@ -2026,6 +2150,12 @@ class SpritePipelineService:
         failure: Exception | None = None
         with self.store.locked_job(job_id) as job:
             candidate = self._candidate(job, candidate_index)
+            self._assert_committed_result_integrity(
+                job_id,
+                job,
+                candidate,
+                error_class=ValidationHarnessError,
+            )
             allowed = {
                 CandidateStatus.received,
                 CandidateStatus.check_failed,
@@ -2033,10 +2163,22 @@ class SpritePipelineService:
             }
             if not candidate.frames:
                 raise ValidationHarnessError("candidate has no frames", details={"candidate_index": candidate_index})
-            if candidate.status not in allowed:
+            stale_approved = (
+                candidate.status == CandidateStatus.approved
+                and candidate.qa_algorithm_version != QA_ALGORITHM_VERSION
+                and not (job.export and job.export.candidate_index == candidate.candidate_index)
+            )
+            if candidate.status not in allowed and not stale_approved:
                 raise ConflictError(
                     "candidate is not ready for QA",
                     details={"candidate_index": candidate_index, "status": candidate.status.value},
+                )
+            if stale_approved:
+                job.touch(
+                    "candidate_approval_invalidated_by_qa_upgrade",
+                    candidate_index=candidate_index,
+                    previous_qa_algorithm_version=candidate.qa_algorithm_version,
+                    current_qa_algorithm_version=QA_ALGORITHM_VERSION,
                 )
             try:
                 self._run_candidate_qa(job_id, job, candidate)
@@ -2054,6 +2196,7 @@ class SpritePipelineService:
                 candidate.status = CandidateStatus.check_failed
                 candidate.qa_completed_at = None
                 candidate.qa_input_sha256 = None
+                candidate.qa_algorithm_version = None
                 candidate.error = error
                 self._refresh_job_status(job)
                 job.touch("candidate_check_failed", candidate_index=candidate_index, error=error)
@@ -2064,6 +2207,7 @@ class SpritePipelineService:
     def _run_candidate_qa(self, job_id: str, job: JobRecord, candidate: CandidateRecord) -> None:
         candidate.qa_completed_at = None
         candidate.qa_input_sha256 = None
+        candidate.qa_algorithm_version = None
         input_digest_before = self._verified_frame_digest(
             job_id,
             job,
@@ -2113,6 +2257,19 @@ class SpritePipelineService:
             )
         preview_dir = self.store.job_dir(job_id) / "previews"
         prefix = preview_dir / candidate.candidate_id
+        preview_suffixes = {
+            "sheet": ".sheet.png",
+            "gif": ".preview.gif",
+            "zoom_gif": ".zoom.gif",
+            "grid": ".grid.png",
+            "baseline": ".baseline.png",
+            "overlay": ".overlay.png",
+        }
+        # Derived previews are disposable. Remove the previous QA generation
+        # before rebuilding so a failed builder can never leave an old image
+        # masquerading as the current frame set.
+        for suffix in preview_suffixes.values():
+            prefix.with_suffix(suffix).unlink(missing_ok=True)
         sheet_columns, sheet_rows, sheet_cells = self._candidate_sheet_layout(job, candidate)
         preview_builders = (
             (
@@ -2156,12 +2313,21 @@ class SpritePipelineService:
                     scale=4,
                 ),
             ),
-            ("overlay", lambda: build_overlay(frame_paths, prefix.with_suffix(".overlay.png"), scale=4)),
+            (
+                "overlay",
+                lambda: build_overlay(
+                    frame_paths,
+                    prefix.with_suffix(".overlay.png"),
+                    scale=4,
+                    loop=job.action.loop,
+                ),
+            ),
         )
         for artifact, builder in preview_builders:
             try:
                 builder()
             except (OSError, ValueError, SyntaxError) as exc:
+                prefix.with_suffix(preview_suffixes[artifact]).unlink(missing_ok=True)
                 candidate.warnings.append(
                     QAIssue(
                         code="preview_generation_failed",
@@ -2185,6 +2351,8 @@ class SpritePipelineService:
             )
         candidate.qa_input_sha256 = input_digest_after
         candidate.qa_completed_at = utc_now()
+        candidate.qa_algorithm_version = QA_ALGORITHM_VERSION
+        self._finalize_qa_change_summary(candidate)
         candidate.error = None
         candidate.status = CandidateStatus.check_failed if candidate.hard_failures else CandidateStatus.review_ready
         self._refresh_job_status(job)
@@ -2254,11 +2422,111 @@ class SpritePipelineService:
             elif previous:
                 frame.repair_attempts = previous.repair_attempts
 
+    @staticmethod
+    def _qa_issue_identity(issue: QAIssue) -> tuple[Any, ...]:
+        """Match issue type and frame scope, not fluctuating measurements."""
+
+        raw_indices = issue.metrics.get("frame_indices")
+        frame_indices: tuple[int, ...] = ()
+        if isinstance(raw_indices, (list, tuple, set)):
+            normalized: set[int] = set()
+            for value in raw_indices:
+                if isinstance(value, bool):
+                    continue
+                try:
+                    normalized.add(int(value))
+                except (TypeError, ValueError):
+                    continue
+            frame_indices = tuple(sorted(normalized))
+
+        def endpoint(name: str) -> int | str | None:
+            value = issue.metrics.get(name)
+            if value is None or isinstance(value, bool):
+                return None
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return str(value)
+
+        return (
+            issue.severity.value,
+            issue.code,
+            issue.frame_index,
+            frame_indices,
+            endpoint("from"),
+            endpoint("to"),
+        )
+
+    @staticmethod
+    def _successful_qa_baseline(candidate: CandidateRecord) -> QAIssueBaseline | None:
+        if (
+            candidate.qa_completed_at is None
+            or not candidate.qa_input_sha256
+            or candidate.error is not None
+        ):
+            return None
+        issues = [
+            issue.model_copy(deep=True)
+            for issue in (*candidate.hard_failures, *candidate.warnings)
+        ]
+        return QAIssueBaseline(
+            qa_input_sha256=candidate.qa_input_sha256,
+            qa_algorithm_version=candidate.qa_algorithm_version,
+            qa_completed_at=candidate.qa_completed_at,
+            issues=issues,
+        )
+
+    def _finalize_qa_change_summary(self, candidate: CandidateRecord) -> None:
+        baseline = candidate.qa_issue_baseline
+        if baseline is None or not candidate.qa_input_sha256:
+            # Initial QA has no honest comparison. Keep a previous repair summary
+            # visible across an ordinary recheck until another edit supersedes it.
+            return
+
+        current = [
+            issue.model_copy(deep=True)
+            for issue in (*candidate.hard_failures, *candidate.warnings)
+        ]
+        available: dict[tuple[Any, ...], list[tuple[int, QAIssue]]] = {}
+        for index, issue in enumerate(current):
+            available.setdefault(self._qa_issue_identity(issue), []).append((index, issue))
+
+        resolved: list[QAIssue] = []
+        persisting: list[QAIssue] = []
+        matched_current: set[int] = set()
+        for old_issue in baseline.issues:
+            matches = available.get(self._qa_issue_identity(old_issue), [])
+            if matches:
+                current_index, current_issue = matches.pop(0)
+                matched_current.add(current_index)
+                persisting.append(current_issue)
+            else:
+                resolved.append(old_issue.model_copy(deep=True))
+        new = [issue for index, issue in enumerate(current) if index not in matched_current]
+
+        candidate.qa_change_summary = QAChangeSummary(
+            compared_at=utc_now(),
+            baseline_qa_input_sha256=baseline.qa_input_sha256,
+            current_qa_input_sha256=candidate.qa_input_sha256,
+            baseline_qa_algorithm_version=baseline.qa_algorithm_version,
+            current_qa_algorithm_version=QA_ALGORITHM_VERSION,
+            resolved=resolved,
+            new=new,
+            persisting=persisting,
+        )
+        candidate.qa_issue_baseline = None
+
     def review_frame(self, job_id: str, candidate_index: int, review: FrameReviewRequest | dict[str, Any]) -> JobRecord:
         if not isinstance(review, FrameReviewRequest):
             review = FrameReviewRequest.model_validate(review)
+        if review.status == ReviewStatus.rejected:
+            raise ValidationHarnessError(
+                "reject the whole candidate instead of rejecting one frame",
+                details={"reason": "candidate_rejection_required"},
+            )
         with self.store.locked_job(job_id) as job:
             candidate = self._candidate(job, candidate_index)
+            self._assert_candidate_editable(job, candidate, operation="review frame")
             frame = self._frame(candidate, review.frame_index)
             if review.status in (ReviewStatus.approved, ReviewStatus.repair_requested):
                 self._assert_qa_current(job_id, job, candidate)
@@ -2353,11 +2621,10 @@ class SpritePipelineService:
             candidate.status = CandidateStatus.rejected
             now = utc_now()
             for frame in candidate.frames:
-                if frame.review_status == ReviewStatus.pending:
-                    frame.review_status = ReviewStatus.rejected
-                    frame.reviewed_by = reviewer
-                    frame.reviewed_at = now
-                    frame.review_note = note
+                frame.review_status = ReviewStatus.rejected
+                frame.reviewed_by = reviewer
+                frame.reviewed_at = now
+                frame.review_note = note
             self._refresh_job_status(job)
             job.touch("candidate_rejected", candidate_index=candidate_index, reviewer=reviewer, note=note)
         return self.store.load(job_id)
@@ -2373,43 +2640,95 @@ class SpritePipelineService:
         job = self.store.load(job_id)
         candidate = self._candidate(job, candidate_index)
         frame = self._frame(candidate, frame_index)
-        source = self.store.resolve_job_path(job_id, frame.active_path)
-        actual_sha256 = sha256_file(source)
-        if actual_sha256 != frame.sha256:
-            raise ConflictError(
-                "active frame changed outside the recorded job state",
-                details={
-                    "frame_index": frame_index,
-                    "recorded_sha256": frame.sha256,
-                    "actual_sha256": actual_sha256,
-                },
-            )
-        try:
-            with Image.open(source) as opened:
-                opened.load()
-                image = opened.convert("RGBA")
-        except Exception as exc:
-            raise ValidationHarnessError(
-                "active frame cannot be decoded for pixel editing",
-                details={"frame_index": frame_index, "error": str(exc)},
-            ) from exc
-
         expected_size = (job.character.cell_width, job.character.cell_height)
-        if image.size != expected_size:
-            raise ValidationHarnessError(
-                "active frame has the wrong size for pixel editing",
-                details={"actual": list(image.size), "expected": list(expected_size)},
-            )
+
+        def read_frame_rgba(target: Any) -> bytes:
+            source = self.store.resolve_job_path(job_id, target.active_path)
+            actual_sha256 = sha256_file(source)
+            if actual_sha256 != target.sha256:
+                raise ConflictError(
+                    "active frame changed outside the recorded job state",
+                    details={
+                        "reason": "active_frame_integrity_mismatch",
+                        "frame_index": target.index,
+                        "recorded_sha256": target.sha256,
+                        "actual_sha256": actual_sha256,
+                    },
+                )
+            try:
+                with Image.open(source) as opened:
+                    opened.load()
+                    image = opened.convert("RGBA")
+            except Exception as exc:
+                raise ValidationHarnessError(
+                    "active frame cannot be decoded for pixel editing",
+                    details={"frame_index": target.index, "error": str(exc)},
+                ) from exc
+            if image.size != expected_size:
+                raise ValidationHarnessError(
+                    "active frame has the wrong size for pixel editing",
+                    details={
+                        "frame_index": target.index,
+                        "actual": list(image.size),
+                        "expected": list(expected_size),
+                    },
+                )
+            return image.tobytes()
+
+        current_position = next(
+            index for index, item in enumerate(candidate.frames) if item.index == frame.index
+        )
+
+        neighbor_warnings: dict[str, dict[str, Any]] = {}
+
+        def neighbour(label: str, offset: int) -> dict[str, Any] | None:
+            if len(candidate.frames) <= 1:
+                return None
+            position = current_position + offset
+            if position < 0 or position >= len(candidate.frames):
+                if not job.action.loop:
+                    return None
+                position %= len(candidate.frames)
+            target = candidate.frames[position]
+            try:
+                rgba = read_frame_rgba(target)
+            except Exception as exc:
+                details = getattr(exc, "details", {}) or {}
+                neighbor_warnings[label] = {
+                    "frame_index": target.index,
+                    "reason": details.get("reason", "neighbor_unavailable"),
+                    "message": str(exc),
+                }
+                return None
+            return {"frame_index": target.index, "sha256": target.sha256, "rgba": rgba}
+
         return {
             "job_id": job_id,
             "candidate_index": candidate_index,
             "frame_index": frame_index,
-            "width": image.width,
-            "height": image.height,
-            "rgba": image.tobytes(),
+            "frame_count": len(candidate.frames),
+            "loop": job.action.loop,
+            "width": expected_size[0],
+            "height": expected_size[1],
+            "alpha_visible_threshold": job.character.qa.alpha_visible_threshold,
+            "rgba": read_frame_rgba(frame),
+            "neighbors": {
+                "previous": neighbour("previous", -1),
+                "next": neighbour("next", 1),
+            },
+            "neighbor_warnings": neighbor_warnings,
             "base_sha256": frame.sha256,
             "review_status": frame.review_status.value,
-            "can_edit": frame.review_status == ReviewStatus.repair_requested,
+            "candidate_status": candidate.status.value,
+            "can_edit": (
+                frame.review_status == ReviewStatus.repair_requested
+                and candidate.status not in {
+                    CandidateStatus.approved,
+                    CandidateStatus.rejected,
+                    CandidateStatus.failed,
+                }
+                and not (job.export and job.export.candidate_index == candidate.candidate_index)
+            ),
             "manual_edit_versions": frame.manual_edit_versions,
             "external_repair_attempts": frame.repair_attempts,
         }
@@ -2441,6 +2760,7 @@ class SpritePipelineService:
 
         with self.store.locked_job(job_id) as job:
             candidate = self._candidate(job, candidate_index)
+            self._assert_candidate_editable(job, candidate, operation="edit frame pixels")
             frame = self._frame(candidate, frame_index)
             expected_size = (job.character.cell_width, job.character.cell_height)
             actual_size = (int(width), int(height))
@@ -2455,18 +2775,23 @@ class SpritePipelineService:
                     "pixel edit RGBA byte count is invalid",
                     details={"actual": len(rgba), "expected": expected_bytes},
                 )
-            if frame.review_status != ReviewStatus.repair_requested:
-                raise ConflictError(
-                    "frame must be explicitly marked repair_requested before pixel editing",
-                    details={"frame_index": frame_index, "review_status": frame.review_status.value},
-                )
             if frame.sha256 != base_sha256:
                 raise ConflictError(
                     "pixel edit is based on a stale frame version",
                     details={
+                        "reason": "stale_frame_version",
                         "frame_index": frame_index,
                         "expected_sha256": frame.sha256,
                         "received_sha256": base_sha256,
+                    },
+                )
+            if frame.review_status != ReviewStatus.repair_requested:
+                raise ConflictError(
+                    "frame must be explicitly marked repair_requested before pixel editing",
+                    details={
+                        "reason": "frame_not_marked_for_repair",
+                        "frame_index": frame_index,
+                        "review_status": frame.review_status.value,
                     },
                 )
 
@@ -2474,7 +2799,7 @@ class SpritePipelineService:
             if sha256_file(active_source) != frame.sha256:
                 raise ConflictError(
                     "active frame changed outside the recorded job state",
-                    details={"frame_index": frame_index},
+                    details={"reason": "active_frame_integrity_mismatch", "frame_index": frame_index},
                 )
             try:
                 with Image.open(active_source) as opened:
@@ -2488,8 +2813,10 @@ class SpritePipelineService:
             if before == rgba:
                 raise ValidationHarnessError(
                     "pixel edit does not change any pixels",
-                    details={"frame_index": frame_index},
+                    details={"reason": "no_pixel_changes", "frame_index": frame_index},
                 )
+
+            qa_issue_baseline = self._successful_qa_baseline(candidate)
 
             changed_pixels: list[int] = []
             for offset in range(0, expected_bytes, 4):
@@ -2553,8 +2880,17 @@ class SpritePipelineService:
             frame.reviewed_at = None
             frame.review_note = ""
             candidate.status = CandidateStatus.received
+            candidate.hard_failures = []
+            candidate.warnings = []
+            candidate.error = None
             candidate.qa_completed_at = None
             candidate.qa_input_sha256 = None
+            candidate.qa_algorithm_version = None
+            candidate.qa_issue_baseline = qa_issue_baseline
+            candidate.qa_change_summary = None
+            for candidate_frame in candidate.frames:
+                candidate_frame.hard_failures = []
+                candidate_frame.warnings = []
             job.status = JobStatus.review_required
             job.touch(
                 "frame_pixels_edited",
@@ -2565,7 +2901,14 @@ class SpritePipelineService:
                 changed_bbox=changed_bbox,
                 reviewer=editor_name,
             )
-        return self.check_candidate(job_id, candidate_index)
+        # The version above is already durable. A preview/QA failure must not
+        # turn the response into a misleading "save failed" error. The check
+        # records its own failure on the candidate; return that recoverable
+        # state so callers can distinguish saved data from a failed recheck.
+        try:
+            return self.check_candidate(job_id, candidate_index)
+        except Exception:
+            return self.store.load(job_id)
 
     def edit_frame_png(
         self,
@@ -2574,7 +2917,7 @@ class SpritePipelineService:
         frame_index: int,
         source: str | Path,
         *,
-        base_sha256: str | None = None,
+        base_sha256: str,
         reviewer: str = "codex",
     ) -> JobRecord:
         """Commit a local PNG through the unlimited manual-edit version path."""
@@ -2597,7 +2940,11 @@ class SpritePipelineService:
                 "pixel edit frame cannot be decoded",
                 details={"path": str(source_path), "error": str(exc)},
             ) from exc
-        session = self.get_frame_edit_session(job_id, candidate_index, frame_index)
+        if not isinstance(base_sha256, str) or not base_sha256.strip():
+            raise ValidationHarnessError(
+                "pixel edit requires the base frame sha256",
+                details={"reason": "missing_base_sha256", "frame_index": frame_index},
+            )
         return self.edit_frame_pixels(
             job_id,
             candidate_index,
@@ -2605,17 +2952,41 @@ class SpritePipelineService:
             rgba=image.tobytes(),
             width=image.width,
             height=image.height,
-            base_sha256=base_sha256 or str(session["base_sha256"]),
+            base_sha256=base_sha256,
             reviewer=reviewer,
         )
 
-    def replace_frame(self, job_id: str, candidate_index: int, frame_index: int, source: str | Path) -> JobRecord:
+    def replace_frame(
+        self,
+        job_id: str,
+        candidate_index: int,
+        frame_index: int,
+        source: str | Path,
+        *,
+        base_sha256: str,
+    ) -> JobRecord:
         source_path = Path(source).resolve()
         if not source_path.is_file():
             raise NotFoundError("replacement frame not found", details={"path": str(source_path)})
         with self.store.locked_job(job_id) as job:
             candidate = self._candidate(job, candidate_index)
+            self._assert_candidate_editable(job, candidate, operation="replace frame")
             frame = self._frame(candidate, frame_index)
+            if not isinstance(base_sha256, str) or not base_sha256.strip():
+                raise ValidationHarnessError(
+                    "frame replacement requires the base frame sha256",
+                    details={"reason": "missing_base_sha256", "frame_index": frame_index},
+                )
+            if frame.sha256 != base_sha256:
+                raise ConflictError(
+                    "frame replacement is based on a stale frame version",
+                    details={
+                        "reason": "stale_frame_version",
+                        "frame_index": frame_index,
+                        "expected_sha256": frame.sha256,
+                        "received_sha256": base_sha256,
+                    },
+                )
             if frame.repair_attempts >= 2:
                 raise ConflictError("frame repair limit reached", details={"frame_index": frame_index, "limit": 2})
             if frame.review_status != ReviewStatus.repair_requested:
@@ -2623,6 +2994,13 @@ class SpritePipelineService:
                     "frame must be explicitly marked repair_requested before replacement",
                     details={"frame_index": frame_index, "review_status": frame.review_status.value},
                 )
+            active_source = self.store.resolve_job_path(job_id, frame.active_path)
+            if sha256_file(active_source) != frame.sha256:
+                raise ConflictError(
+                    "active frame changed outside the recorded job state",
+                    details={"reason": "active_frame_integrity_mismatch", "frame_index": frame_index},
+                )
+            qa_issue_baseline = self._successful_qa_baseline(candidate)
             version = frame.repair_attempts + 1
             destination = (
                 self.store.job_dir(job_id)
@@ -2664,11 +3042,25 @@ class SpritePipelineService:
             frame.reviewed_at = None
             frame.review_note = ""
             candidate.status = CandidateStatus.received
+            candidate.hard_failures = []
+            candidate.warnings = []
+            candidate.error = None
             candidate.qa_completed_at = None
             candidate.qa_input_sha256 = None
+            candidate.qa_algorithm_version = None
+            candidate.qa_issue_baseline = qa_issue_baseline
+            candidate.qa_change_summary = None
+            for candidate_frame in candidate.frames:
+                candidate_frame.hard_failures = []
+                candidate_frame.warnings = []
             job.status = JobStatus.review_required
             job.touch("frame_replaced", candidate_index=candidate_index, frame_index=frame_index, repair_attempt=version)
-        return self.check_candidate(job_id, candidate_index)
+        # The replacement is already durable at this point. Preserve and
+        # return it even if preview generation or QA fails afterwards.
+        try:
+            return self.check_candidate(job_id, candidate_index)
+        except Exception:
+            return self.store.load(job_id)
 
     def export_candidate(
         self,
@@ -2762,6 +3154,7 @@ class SpritePipelineService:
                 "critical_frame_indices": job.action.critical_frame_indices,
                 "alpha": True,
                 "qa_input_sha256": candidate.qa_input_sha256,
+                "qa_algorithm_version": candidate.qa_algorithm_version,
                 "source_frames": [
                     {"index": frame.index, "path": frame.active_path, "sha256": frame.sha256}
                     for frame in candidate.frames
@@ -2775,6 +3168,7 @@ class SpritePipelineService:
                 "diagnostic_only": candidate.diagnostic_only,
                 "qa_completed_at": candidate.qa_completed_at.isoformat() if candidate.qa_completed_at else None,
                 "qa_input_sha256": candidate.qa_input_sha256,
+                "qa_algorithm_version": candidate.qa_algorithm_version,
                 "hard_failures": [item.model_dump(mode="json") for item in candidate.hard_failures],
                 "warnings": [item.model_dump(mode="json") for item in candidate.warnings],
                 "frames": [
@@ -2917,6 +3311,37 @@ class SpritePipelineService:
         raise NotFoundError("candidate not found", details={"candidate_index": candidate_index})
 
     @staticmethod
+    def _assert_candidate_editable(
+        job: JobRecord,
+        candidate: CandidateRecord,
+        *,
+        operation: str,
+    ) -> None:
+        if candidate.status in {
+            CandidateStatus.approved,
+            CandidateStatus.rejected,
+            CandidateStatus.failed,
+        }:
+            raise ConflictError(
+                "terminal candidate cannot be changed",
+                details={
+                    "reason": "terminal_candidate",
+                    "operation": operation,
+                    "candidate_index": candidate.candidate_index,
+                    "candidate_status": candidate.status.value,
+                },
+            )
+        if job.export and job.export.candidate_index == candidate.candidate_index:
+            raise ConflictError(
+                "exported candidate cannot be changed",
+                details={
+                    "reason": "exported_candidate_immutable",
+                    "operation": operation,
+                    "candidate_index": candidate.candidate_index,
+                },
+            )
+
+    @staticmethod
     def _candidate_expected_frame_count(job: JobRecord, candidate: CandidateRecord) -> int:
         """Check the usable sequence that was actually received."""
 
@@ -3055,7 +3480,17 @@ class SpritePipelineService:
         return digest.hexdigest()
 
     def _assert_qa_current(self, job_id: str, job: JobRecord, candidate: CandidateRecord) -> None:
-        if candidate.qa_completed_at is None or not candidate.qa_input_sha256:
+        self._assert_committed_result_integrity(
+            job_id,
+            job,
+            candidate,
+            error_class=ExportBlockedError,
+        )
+        if (
+            candidate.qa_completed_at is None
+            or not candidate.qa_input_sha256
+            or candidate.qa_algorithm_version != QA_ALGORITHM_VERSION
+        ):
             raise ExportBlockedError("candidate has no completed QA record")
         current_digest = self._verified_frame_digest(
             job_id,

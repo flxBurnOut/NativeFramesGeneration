@@ -19,11 +19,11 @@ if str(PROJECT_ROOT) not in sys.path:
 if str(TESTS_ROOT) not in sys.path:
     sys.path.insert(0, str(TESTS_ROOT))
 
-from sprite_pipeline.errors import ConflictError, ProviderTemporaryError, ValidationHarnessError
+from sprite_pipeline.errors import ConflictError, ExportBlockedError, ProviderTemporaryError, ValidationHarnessError
 from sprite_pipeline.credential_store import CredentialStore
 from sprite_pipeline.jsonio import atomic_write_json
 from sprite_pipeline.migration import LegacyLayoutMigrator
-from sprite_pipeline.models import CandidateStatus, GenerationRequest, JobStatus, utc_now
+from sprite_pipeline.models import CandidateStatus, GenerationRequest, JobStatus, ReviewStatus, utc_now
 from sprite_pipeline.providers.base import PollResult, PollStatus, ProviderRequest, Submission
 from sprite_pipeline.providers.pixellab import PixelLabProvider
 from sprite_pipeline.service import SpritePipelineService
@@ -423,6 +423,270 @@ class QuotaAndResultSafetyTests(unittest.TestCase):
             self.service.get_job(job.job_id).generation_requested_at
         )
 
+    def test_repaired_frame_keeps_original_provider_result_integrity(self) -> None:
+        job = self.service.create_job(self.harness.create_request("pixellab"))
+        with self.service.store.locked_job(job.job_id) as pending_job:
+            candidate = pending_job.candidates[0]
+            candidate.status = CandidateStatus.saving
+            candidate.provider_job_id = "repair-safety-123456"
+            candidate.provider_status = "completed"
+            candidate.submission_attempts = 1
+        self.service._store_provider_frames(
+            job.job_id,
+            1,
+            self._frame_bytes(),
+            diagnostic_only=False,
+            expected_provider_job_id="repair-safety-123456",
+        )
+        checked = self.service.check_candidate(job.job_id, 1)
+        original = checked.candidates[0].frames[0]
+        original_bytes = self.service.store.resolve_job_path(
+            job.job_id,
+            original.raw_path,
+        ).read_bytes()
+        self.service.review_frame(
+            job.job_id,
+            1,
+            {
+                "frame_index": 0,
+                "status": "repair_requested",
+                "issue_type": "other",
+                "reviewer": "result-safety-test",
+            },
+        )
+        session = self.service.get_frame_edit_session(job.job_id, 1, 0)
+        edited = bytearray(session["rgba"])
+        offset = (10 * session["width"] + 10) * 4
+        edited[offset : offset + 4] = bytes((7, 29, 61, 255))
+        saved = self.service.edit_frame_pixels(
+            job.job_id,
+            1,
+            0,
+            rgba=bytes(edited),
+            width=session["width"],
+            height=session["height"],
+            base_sha256=session["base_sha256"],
+            reviewer="result-safety-test",
+        )
+        active = saved.candidates[0].frames[0]
+        self.assertNotEqual(active.active_path, active.raw_path)
+        self.assertNotEqual(active.sha256, original.sha256)
+        self.assertEqual(
+            self.service.store.resolve_job_path(job.job_id, active.raw_path).read_bytes(),
+            original_bytes,
+        )
+        self.assertTrue(self.service.candidate_safety(job.job_id, 1)["result_integrity"])
+
+    def test_reconciliation_preserves_repaired_active_frame(self) -> None:
+        job = self.service.create_job(self.harness.create_request("pixellab"))
+        with self.service.store.locked_job(job.job_id) as pending_job:
+            candidate = pending_job.candidates[0]
+            candidate.status = CandidateStatus.saving
+            candidate.provider_job_id = "repair-reconcile-123456"
+            candidate.provider_status = "completed"
+            candidate.submission_attempts = 1
+        self.service._store_provider_frames(
+            job.job_id,
+            1,
+            self._frame_bytes(),
+            diagnostic_only=False,
+            expected_provider_job_id="repair-reconcile-123456",
+        )
+        self.service.check_candidate(job.job_id, 1)
+        self.service.review_frame(
+            job.job_id,
+            1,
+            {
+                "frame_index": 0,
+                "status": "repair_requested",
+                "issue_type": "other",
+                "reviewer": "reconcile-test",
+            },
+        )
+        session = self.service.get_frame_edit_session(job.job_id, 1, 0)
+        edited = bytearray(session["rgba"])
+        edited[(11 * session["width"] + 11) * 4 : (11 * session["width"] + 11) * 4 + 4] = bytes(
+            (91, 17, 43, 255)
+        )
+        repaired = self.service.edit_frame_pixels(
+            job.job_id,
+            1,
+            0,
+            rgba=bytes(edited),
+            width=session["width"],
+            height=session["height"],
+            base_sha256=session["base_sha256"],
+            reviewer="reconcile-test",
+        )
+        before_frames = [
+            frame.model_dump(mode="json")
+            for frame in repaired.candidates[0].frames
+        ]
+        commit = (
+            self.service.store.job_dir(job.job_id)
+            / "raw"
+            / "candidate_01"
+            / "result.commit.json"
+        )
+        commit.unlink()
+        with self.service.store.locked_job(job.job_id) as legacy_job:
+            candidate = legacy_job.candidates[0]
+            candidate.result_manifest_path = None
+            candidate.result_sha256 = None
+            candidate.result_saved_at = None
+
+        recovered = self.service.reconcile_saved_results(job.job_id)
+        recovered_candidate = recovered.candidates[0]
+        self.assertEqual(
+            [frame.model_dump(mode="json") for frame in recovered_candidate.frames],
+            before_frames,
+        )
+        self.assertNotEqual(
+            recovered_candidate.frames[0].active_path,
+            recovered_candidate.frames[0].raw_path,
+        )
+        self.assertIsNone(recovered_candidate.error)
+        self.assertTrue(commit.is_file())
+        self.assertTrue(self.service.candidate_safety(job.job_id, 1)["result_integrity"])
+
+    def test_reconciliation_failure_can_recover_without_leaving_candidate_in_saving(self) -> None:
+        job = self.service.create_job(self.harness.create_request("pixellab"))
+        with self.service.store.locked_job(job.job_id) as pending_job:
+            candidate = pending_job.candidates[0]
+            candidate.status = CandidateStatus.saving
+            candidate.provider_job_id = "retry-reconcile-123456"
+            candidate.provider_status = "completed"
+            candidate.submission_attempts = 1
+        self.service._store_provider_frames(
+            job.job_id,
+            1,
+            self._frame_bytes(),
+            diagnostic_only=False,
+            expected_provider_job_id="retry-reconcile-123456",
+        )
+        checked = self.service.check_candidate(job.job_id, 1)
+        before_status = checked.candidates[0].status
+        raw_path = self.service.store.resolve_job_path(
+            job.job_id,
+            checked.candidates[0].frames[0].raw_path,
+        )
+        original_bytes = raw_path.read_bytes()
+        commit = raw_path.parent / "result.commit.json"
+        commit.unlink()
+        with self.service.store.locked_job(job.job_id) as legacy_job:
+            candidate = legacy_job.candidates[0]
+            candidate.result_manifest_path = None
+            candidate.result_sha256 = None
+            candidate.result_saved_at = None
+        raw_path.write_bytes(b"corrupt provider frame")
+
+        failed_job = self.service.reconcile_saved_results(job.job_id)
+        failed = failed_job.candidates[0]
+        self.assertEqual(failed.status, before_status)
+        self.assertEqual(failed.error["code"], "stored_result_reconciliation_failed")
+        failed_history = set(
+            (self.service.store.job_dir(job.job_id) / "history").glob("job_*.json")
+        )
+        repeated_job = self.service.reconcile_saved_results(job.job_id)
+        self.assertEqual(repeated_job.revision, failed_job.revision)
+        self.assertEqual(
+            set((self.service.store.job_dir(job.job_id) / "history").glob("job_*.json")),
+            failed_history,
+        )
+
+        # Simulate a record already affected by an older build that forced the
+        # candidate into saving after the same recoverable integrity error.
+        with self.service.store.locked_job(job.job_id) as stale_job:
+            stale_job.candidates[0].status = CandidateStatus.saving
+        raw_path.write_bytes(original_bytes)
+        recovered = self.service.reconcile_saved_results(job.job_id).candidates[0]
+
+        self.assertNotEqual(recovered.status, CandidateStatus.saving)
+        self.assertIsNone(recovered.error)
+        self.assertTrue(commit.is_file())
+        self.assertTrue(self.service.candidate_safety(job.job_id, 1)["result_integrity"])
+
+    def test_corrupt_provider_source_blocks_recheck_approval_and_export_after_repair(self) -> None:
+        job = self.service.create_job(self.harness.create_request("pixellab"))
+        with self.service.store.locked_job(job.job_id) as pending_job:
+            candidate = pending_job.candidates[0]
+            candidate.status = CandidateStatus.saving
+            candidate.provider_job_id = "integrity-gate-123456"
+            candidate.provider_status = "completed"
+            candidate.submission_attempts = 1
+        self.service._store_provider_frames(
+            job.job_id,
+            1,
+            self._frame_bytes(),
+            diagnostic_only=False,
+            expected_provider_job_id="integrity-gate-123456",
+        )
+        self.service.check_candidate(job.job_id, 1)
+        self.service.review_frame(
+            job.job_id,
+            1,
+            {
+                "frame_index": 0,
+                "status": "repair_requested",
+                "issue_type": "other",
+                "reviewer": "integrity-gate-test",
+            },
+        )
+        session = self.service.get_frame_edit_session(job.job_id, 1, 0)
+        edited = bytearray(session["rgba"])
+        offset = (12 * session["width"] + 12) * 4
+        edited[offset : offset + 4] = bytes((13, 37, 71, 255))
+        repaired = self.service.edit_frame_pixels(
+            job.job_id,
+            1,
+            0,
+            rgba=bytes(edited),
+            width=session["width"],
+            height=session["height"],
+            base_sha256=session["base_sha256"],
+            reviewer="integrity-gate-test",
+        )
+        self.assertNotEqual(
+            repaired.candidates[0].frames[0].active_path,
+            repaired.candidates[0].frames[0].raw_path,
+        )
+
+        raw_path = self.service.store.resolve_job_path(
+            job.job_id,
+            repaired.candidates[0].frames[0].raw_path,
+        )
+        (raw_path.parent / "result.commit.json").unlink()
+        with self.service.store.locked_job(job.job_id) as legacy_job:
+            candidate = legacy_job.candidates[0]
+            candidate.result_manifest_path = None
+            candidate.result_sha256 = None
+            candidate.result_saved_at = None
+        raw_path.write_bytes(b"corrupt provider frame")
+        failed = self.service.reconcile_saved_results(job.job_id).candidates[0]
+        self.assertEqual(failed.error["code"], "stored_result_reconciliation_failed")
+
+        with self.assertRaises(ValidationHarnessError):
+            self.service.check_candidate(job.job_id, 1)
+        still_failed = self.service.get_job(job.job_id).candidates[0]
+        self.assertEqual(still_failed.error["code"], "stored_result_reconciliation_failed")
+        with self.assertRaises(ExportBlockedError):
+            self.service.approve_candidate(
+                job.job_id,
+                1,
+                reviewer="integrity-gate-test",
+                acknowledge_warnings=True,
+            )
+
+        # Simulate a record approved by an older build: export still enforces
+        # the immutable provider-source contract at its final service gate.
+        with self.service.store.locked_job(job.job_id) as stale_job:
+            candidate = stale_job.candidates[0]
+            candidate.status = CandidateStatus.approved
+            for frame in candidate.frames:
+                frame.review_status = ReviewStatus.approved
+        with self.assertRaises(ExportBlockedError):
+            self.service.export_candidate(job.job_id, 1)
+
     def test_job_journal_recovers_a_corrupt_current_record(self) -> None:
         job = self.service.create_job(self.harness.create_request("import"))
         current = self.service.store.job_dir(job.job_id) / "job.json"
@@ -430,6 +694,81 @@ class QuotaAndResultSafetyTests(unittest.TestCase):
         recovered = self.service.get_job(job.job_id)
         self.assertEqual(recovered.job_id, job.job_id)
         self.assertEqual(self.service.list_jobs()[0]["job_id"], job.job_id)
+
+    def test_job_catalog_reads_lightweight_summary_without_loading_job(self) -> None:
+        request = self.harness.create_request("fixture")
+        request["candidate_count"] = 3
+        job = self.service.create_job(request)
+        job_dir = self.service.store.job_dir(job.job_id)
+        summary_path = job_dir / "summary.json"
+
+        self.assertTrue(summary_path.is_file())
+        with patch.object(
+            self.service.store,
+            "load",
+            side_effect=AssertionError("catalog must not deep-load job.json"),
+        ):
+            rows = self.service.list_jobs()
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["job_id"], job.job_id)
+        self.assertEqual(rows[0]["candidate_count"], 3)
+        self.assertEqual(rows[0]["saved_candidate_count"], 0)
+        self.assertFalse(rows[0]["needs_recovery"])
+
+    def test_legacy_job_catalog_summary_is_backfilled_once(self) -> None:
+        job = self.service.create_job(self.harness.create_request("import"))
+        summary_path = self.service.store.job_dir(job.job_id) / "summary.json"
+        summary_path.unlink()
+
+        first = self.service.list_jobs()
+        self.assertEqual(first[0]["job_id"], job.job_id)
+        self.assertTrue(summary_path.is_file())
+        with patch.object(
+            self.service.store,
+            "load",
+            side_effect=AssertionError("backfilled catalog must stay lightweight"),
+        ):
+            second = self.service.list_jobs()
+        self.assertEqual(second, first)
+
+    def test_multiple_candidates_share_one_task_folder(self) -> None:
+        request = self.harness.create_request("fixture")
+        request["candidate_count"] = 3
+        created = self.service.create_job(request)
+        completed = self.service.generate_job(created.job_id, wait=True)
+        job_dir = self.service.store.job_dir(completed.job_id)
+
+        self.assertEqual(
+            {path.name for path in (job_dir / "raw").iterdir() if path.is_dir()},
+            {"candidate_01", "candidate_02", "candidate_03"},
+        )
+        self.assertTrue(
+            all(
+                frame.active_path.startswith(f"raw/{candidate.candidate_id}/")
+                for candidate in completed.candidates
+                for frame in candidate.frames
+            )
+        )
+        rows = self.service.list_jobs()
+        self.assertEqual(rows[0]["candidate_count"], 3)
+        self.assertEqual(rows[0]["saved_candidate_count"], 3)
+        self.assertEqual(len([path for path in self.service.settings.work_dir.iterdir() if path.name != ".locks"]), 1)
+
+    def test_recovery_scan_does_not_deep_load_completed_catalog_rows(self) -> None:
+        job = self.service.create_job(self.harness.create_request("fixture"))
+        self.service.generate_job(job.job_id, wait=True)
+
+        with patch.object(
+            self.service,
+            "reconcile_saved_results",
+            side_effect=AssertionError("completed assets must remain lazy"),
+        ):
+            scan = self.service.recover_pending_jobs()
+
+        self.assertEqual(scan["advanced"], [])
+        self.assertEqual(scan["attention_required"], [])
+        self.assertEqual(scan["errors"], [])
 
     def test_job_journal_wins_over_a_valid_but_stale_current_record(self) -> None:
         job = self.service.create_job(self.harness.create_request("pixellab"))

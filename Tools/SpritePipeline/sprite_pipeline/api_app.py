@@ -18,7 +18,7 @@ from .errors import (
     ValidationHarnessError,
 )
 from .models import ExportOptions, FrameReviewRequest, GenerationRequest
-from .service import SpritePipelineService
+from .service import QA_ALGORITHM_VERSION, SpritePipelineService
 
 
 class _Body(BaseModel):
@@ -46,6 +46,7 @@ class RejectBody(_Body):
 
 class ReplacementBody(_Body):
     png_base64: str
+    base_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
 class PixelEditBody(_Body):
@@ -104,9 +105,20 @@ def create_api(
     app.state.sprite_pipeline_service = service
     app.state.sprite_pipeline_recovery = recovery_worker
     static_dir = Path(__file__).resolve().parent / "static"
+
+    class _NoStoreStaticFiles(StaticFiles):
+        async def get_response(self, path: str, scope: dict[str, Any]) -> Any:
+            response = await super().get_response(path, scope)
+            # The editor is developed and served locally. Reusing an old HTML/JS
+            # combination can stop the module before it clears the loading mask,
+            # so correctness is more important than browser asset caching here.
+            response.headers["Cache-Control"] = "no-store, max-age=0"
+            response.headers["Pragma"] = "no-cache"
+            return response
+
     app.mount(
         "/pixel-editor-assets",
-        StaticFiles(directory=static_dir),
+        _NoStoreStaticFiles(directory=static_dir),
         name="pixel-editor-assets",
     )
 
@@ -333,7 +345,13 @@ def create_api(
         with tempfile.TemporaryDirectory(prefix="replacement_", dir=service.store.job_dir(job_id) / "input") as temp_name:
             path = Path(temp_name) / "replacement.png"
             path.write_bytes(payload)
-            job = service.replace_frame(job_id, candidate_index, frame_index, path)
+            job = service.replace_frame(
+                job_id,
+                candidate_index,
+                frame_index,
+                path,
+                base_sha256=body.base_sha256,
+            )
         return {"schema_version": 1, "ok": True, "data": {"job": _job(job)}}
 
     @app.get("/v1/jobs/{job_id}/candidates/{candidate_index}/frames/{frame_index}/pixel-edit")
@@ -345,6 +363,11 @@ def create_api(
         session = service.get_frame_edit_session(job_id, candidate_index, frame_index)
         rgba = session.pop("rgba")
         session["rgba_base64"] = base64.b64encode(rgba).decode("ascii")
+        for neighbour in session["neighbors"].values():
+            if neighbour is None:
+                continue
+            neighbour_rgba = neighbour.pop("rgba")
+            neighbour["rgba_base64"] = base64.b64encode(neighbour_rgba).decode("ascii")
         return {"schema_version": 1, "ok": True, "data": {"session": session}}
 
     @app.post("/v1/jobs/{job_id}/candidates/{candidate_index}/frames/{frame_index}/pixel-edit")
@@ -376,16 +399,32 @@ def create_api(
         )
         candidate = next(item for item in job.candidates if item.candidate_index == candidate_index)
         frame = next(item for item in candidate.frames if item.index == frame_index)
+        qa_error = candidate.error
+        qa_completed = bool(
+            candidate.qa_completed_at is not None
+            and candidate.qa_input_sha256
+            and candidate.qa_algorithm_version == QA_ALGORITHM_VERSION
+            and qa_error is None
+        )
         return {
             "schema_version": 1,
             "ok": True,
             "data": {
                 "job": _job(job),
                 "edit": {
+                    "saved": True,
                     "frame_index": frame.index,
                     "sha256": frame.sha256,
                     "manual_edit_versions": frame.manual_edit_versions,
                     "review_status": frame.review_status.value,
+                    "qa": {
+                        "ok": qa_completed,
+                        "completed": qa_completed,
+                        "candidate_status": candidate.status.value,
+                        "hard_failure_count": len(candidate.hard_failures),
+                        "warning_count": len(candidate.warnings),
+                        "error": qa_error,
+                    },
                 },
             },
         }

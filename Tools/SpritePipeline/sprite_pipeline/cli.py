@@ -42,7 +42,7 @@ def _parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("list-presets", help="List character and action presets.")
-    sub.add_parser("list-jobs", help="List recorded jobs.")
+    sub.add_parser("list-jobs", help="List lightweight saved-job summaries.")
 
     create = sub.add_parser("create", help="Create a durable generation/import job.")
     create.add_argument("--request", type=Path, help="GenerationRequest JSON file.")
@@ -145,6 +145,11 @@ def _parser() -> argparse.ArgumentParser:
     replace.add_argument("--candidate", type=int, required=True)
     replace.add_argument("--frame", type=int, required=True)
     replace.add_argument("--source", type=Path, required=True)
+    replace.add_argument(
+        "--base-sha256",
+        required=True,
+        help="SHA-256 returned when the source frame was selected; prevents stale overwrites.",
+    )
 
     pixel_edit = sub.add_parser(
         "pixel-edit-frame",
@@ -154,7 +159,11 @@ def _parser() -> argparse.ArgumentParser:
     pixel_edit.add_argument("--candidate", type=int, required=True)
     pixel_edit.add_argument("--frame", type=int, required=True)
     pixel_edit.add_argument("--source", type=Path, required=True)
-    pixel_edit.add_argument("--base-sha256")
+    pixel_edit.add_argument(
+        "--base-sha256",
+        required=True,
+        help="SHA-256 returned when the source frame was read; prevents stale overwrites.",
+    )
     pixel_edit.add_argument("--reviewer", default="codex")
 
     export = sub.add_parser("export", help="Export an explicitly approved candidate.")
@@ -282,7 +291,13 @@ def _execute(args: argparse.Namespace) -> CommandResult | None:
         job = service.reject_candidate(args.job, args.candidate, reviewer=args.reviewer, note=args.note)
         return CommandResult(operation=command, data={"job": _job_data(job)})
     if command == "replace-frame":
-        job = service.replace_frame(args.job, args.candidate, args.frame, args.source)
+        job = service.replace_frame(
+            args.job,
+            args.candidate,
+            args.frame,
+            args.source,
+            base_sha256=args.base_sha256,
+        )
         return CommandResult(operation=command, data={"job": _job_data(job)})
     if command == "pixel-edit-frame":
         job = service.edit_frame_png(

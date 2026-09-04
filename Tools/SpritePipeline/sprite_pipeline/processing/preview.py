@@ -238,6 +238,7 @@ def build_adjacent_frame_overlay(
     current_opacity: float = 0.65,
     padding: int = 8,
     checker_size: int = 8,
+    loop: bool = False,
 ) -> dict[str, object]:
     """Overlay each frame with its immediate predecessor for continuity review.
 
@@ -266,13 +267,13 @@ def build_adjacent_frame_overlay(
     pairs: list[list[int]] = []
 
     for index, frame in enumerate(loaded):
-        previous_index = max(0, index - 1)
+        previous_index = len(loaded) - 1 if loop and index == 0 and len(loaded) > 1 else max(0, index - 1)
         previous = loaded[previous_index].resize(preview_size, _RESAMPLING.NEAREST)
         current = frame.resize(preview_size, _RESAMPLING.NEAREST)
         cell_x = (index % columns) * cell_width
         cell_y = (index // columns) * cell_height
         board = _checkerboard(preview_size, checker_size)
-        if index > 0:
+        if index > 0 or (loop and len(loaded) > 1):
             board.alpha_composite(
                 _tint_silhouette(previous, (255, 82, 170), previous_opacity)
             )
@@ -280,7 +281,13 @@ def build_adjacent_frame_overlay(
             _tint_silhouette(current, (74, 232, 255), current_opacity)
         )
         canvas.alpha_composite(board, (cell_x + padding, cell_y + padding + label_height))
-        label = f"start {index:03d}" if index == 0 else f"{previous_index:03d} -> {index:03d}"
+        label = (
+            f"{previous_index:03d} -> {index:03d} (loop)"
+            if index == 0 and loop and len(loaded) > 1
+            else f"start {index:03d}"
+            if index == 0
+            else f"{previous_index:03d} -> {index:03d}"
+        )
         draw.text(
             (cell_x + padding, cell_y + padding),
             label,
@@ -297,6 +304,7 @@ def build_adjacent_frame_overlay(
         "comparison_mode": "adjacent_frames",
         "frame_count": len(loaded),
         "pairs": pairs,
+        "loop": loop,
         "columns": columns,
         "rows": rows,
         "scale": scale,
@@ -335,7 +343,11 @@ def build_previews(
         paths, target_dir / "frame_grid.png", scale=scale, columns=columns
     )
     overlay = build_adjacent_frame_overlay(
-        paths, target_dir / "adjacent_frame_overlay.png", scale=scale, columns=columns
+        paths,
+        target_dir / "adjacent_frame_overlay.png",
+        scale=scale,
+        columns=columns,
+        loop=loop,
     )
     return {
         "schema_version": 1,
@@ -448,6 +460,8 @@ def build_overlay(
     output_path: PathLike,
     scale: int = 4,
     columns: int | None = None,
+    *,
+    loop: bool = False,
 ) -> dict[str, object]:
     """Create adjacent-frame onion-skin comparisons for continuity review."""
 
@@ -456,6 +470,7 @@ def build_overlay(
         output_path,
         scale=scale,
         columns=columns,
+        loop=loop,
     )
 
 

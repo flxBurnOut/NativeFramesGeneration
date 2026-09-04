@@ -223,11 +223,21 @@ def run_frame_qa(
     position_jumps: list[dict[str, int | None]] = []
     translation_tolerance = int(effective["rigid_translation_tolerance_px"] or 0)
     absolute_translation_limit = max(1, translation_tolerance * 2)
-    for previous_index, current_index in zip(
-        range(len(frame_reports) - 1), range(1, len(frame_reports))
-    ):
-        previous_image = valid_images.get(previous_index)
-        current_image = valid_images.get(current_index)
+    rigid_images = {
+        index: _mask_below_alpha_threshold(
+            image,
+            int(effective["alpha_threshold"] or 0),
+        )
+        for index, image in valid_images.items()
+    }
+    adjacent_frame_pairs = list(
+        zip(range(len(frame_reports) - 1), range(1, len(frame_reports)))
+    )
+    if loop and len(frame_reports) > 1:
+        adjacent_frame_pairs.append((len(frame_reports) - 1, 0))
+    for previous_index, current_index in adjacent_frame_pairs:
+        previous_image = rigid_images.get(previous_index)
+        current_image = rigid_images.get(current_index)
         if previous_image is None or current_image is None or previous_image.size != current_image.size:
             continue
         previous_bbox = frame_reports[previous_index]["metrics"].get("bbox")
@@ -298,6 +308,47 @@ def run_frame_qa(
             absolute_step_limit=absolute_translation_limit,
         )
 
+    if loop and len(rigid_translations) > 1:
+        first_translation = rigid_translations[0]
+        closing_translation = rigid_translations[-1]
+        if closing_translation["to"] == first_translation["from"]:
+            wrap_velocity_change = max(
+                abs(int(first_translation["dx"] or 0) - int(closing_translation["dx"] or 0)),
+                abs(int(first_translation["dy"] or 0) - int(closing_translation["dy"] or 0)),
+            )
+            first_translation["velocity_change"] = wrap_velocity_change
+            already_reported = any(
+                jump["from"] == first_translation["from"]
+                and jump["to"] == first_translation["to"]
+                for jump in position_jumps
+            )
+            if wrap_velocity_change > translation_tolerance and not already_reported:
+                jump = {
+                    **first_translation,
+                    "velocity_change_limit": translation_tolerance,
+                    "absolute_step_limit": absolute_translation_limit,
+                }
+                position_jumps.append(jump)
+                current_index = int(first_translation["to"] or 0)
+                previous_index = int(first_translation["from"] or 0)
+                _add_hard_failure(
+                    hard_failures,
+                    frame_reports[current_index],
+                    "frame_position_jump",
+                    (
+                        f"Frame {current_index} changes loop translation velocity "
+                        f"abruptly after frame {previous_index}."
+                    ),
+                    previous_frame=previous_index,
+                    dx=int(first_translation["dx"] or 0),
+                    dy=int(first_translation["dy"] or 0),
+                    step_distance=int(first_translation["step_distance"] or 0),
+                    velocity_change=wrap_velocity_change,
+                    velocity_change_limit=translation_tolerance,
+                    absolute_step_limit=absolute_translation_limit,
+                    loop_boundary=True,
+                )
+
     reference_metrics, reference_error = _load_reference_metrics(
         reference_frame,
         valid_images,
@@ -329,9 +380,7 @@ def run_frame_qa(
     centroid_pairs: list[dict[str, object]] = []
     pixel_limit = effective["centroid_jump_pixels"]
     ratio_limit = float(effective["centroid_jump_ratio"] or 0.0)
-    for previous_index, current_index in zip(
-        range(len(frame_reports) - 1), range(1, len(frame_reports))
-    ):
+    for previous_index, current_index in adjacent_frame_pairs:
         previous = frame_reports[previous_index]
         current = frame_reports[current_index]
         previous_centroid = previous["metrics"].get("centroid")
@@ -369,7 +418,14 @@ def run_frame_qa(
             )
 
     centroid_velocity_changes: list[dict[str, object]] = []
-    for previous_pair, current_pair in zip(centroid_pairs, centroid_pairs[1:]):
+    centroid_velocity_pairings = list(zip(centroid_pairs, centroid_pairs[1:]))
+    if (
+        loop
+        and len(centroid_pairs) > 1
+        and centroid_pairs[-1]["to"] == centroid_pairs[0]["from"]
+    ):
+        centroid_velocity_pairings.append((centroid_pairs[-1], centroid_pairs[0]))
+    for previous_pair, current_pair in centroid_velocity_pairings:
         if previous_pair["to"] != current_pair["from"]:
             continue
         velocity_change = math.hypot(
@@ -408,6 +464,11 @@ def run_frame_qa(
                 velocity_change_ratio=round(change_ratio, 6),
                 threshold=threshold_value,
                 threshold_kind=threshold_kind,
+                loop_boundary=bool(
+                    loop
+                    and int(previous_pair["to"]) == 0
+                    and int(current_pair["from"]) == 0
+                ),
             )
 
     try:
@@ -450,9 +511,12 @@ def run_frame_qa(
 
     loop_metric: dict[str, object] | None = None
     if loop and frame_reports:
-        first = valid_images.get(0)
+        # Keep loop endpoint comparison on the same visibility contract as
+        # content bounds and rigid-motion checks.  Near-transparent RGB noise
+        # is not visible game art and must not manufacture a seam warning.
+        first = rigid_images.get(0)
         last_index = len(frame_reports) - 1
-        last = valid_images.get(last_index)
+        last = rigid_images.get(last_index)
         if first is not None and last is not None and first.size == last.size:
             different = sum(
                 left != right
@@ -847,6 +911,17 @@ def _palette_deviation_ratio(
 def _rgba_pixels(image: Image.Image) -> list[bytes]:
     raw = image.tobytes()
     return [raw[offset : offset + 4] for offset in range(0, len(raw), 4)]
+
+
+def _mask_below_alpha_threshold(image: Image.Image, alpha_threshold: int) -> Image.Image:
+    if alpha_threshold <= 0:
+        return image
+    rgba = image.convert("RGBA")
+    pixels = bytearray(rgba.tobytes())
+    for offset in range(0, len(pixels), 4):
+        if pixels[offset + 3] <= alpha_threshold:
+            pixels[offset : offset + 4] = b"\x00\x00\x00\x00"
+    return Image.frombytes("RGBA", rgba.size, bytes(pixels))
 
 
 def _add_hard_failure(
