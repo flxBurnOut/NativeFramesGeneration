@@ -12,11 +12,11 @@
   "sheet_rows": 4,
   "critical_frame_indices": [6],
   "centroid_shift_px": 13,
-  "action_description": "A 16-frame grounded sword attack. Keep frame 1 unchanged; frames 2-4 anticipate, frames 5-7 wind up to a readable charge, frames 8-10 strike and make contact, frames 11-13 follow through, and frames 14-16 recover.",
+  "action_description": "One 16-frame non-looping grounded chop: 1 unchanged; 2-4 sword overhead/shoulder; 5-7 charge, held at 7; 8-10 the only forward vertical high-to-low strike; 11-13 follow through low; 14-16 recovery only.",
   "locked_constraints": [
-    "both feet follow one stable ground path",
-    "frame 7 is the readable charge and skill-freeze pose",
-    "preserve sword length and hand contact",
-    "keep body and sword inside the canvas"
+    "exactly one attack total: one wind-up, strike/contact, follow-through, recovery",
+    "after contact: no wind-up/swing; no repeat, second hit, combo, or loop",
+    "vertical chop only; no horizontal slash, thrust, spin, or projectile",
+    "preserve sword shape/grip/orientation"
   ]
 }

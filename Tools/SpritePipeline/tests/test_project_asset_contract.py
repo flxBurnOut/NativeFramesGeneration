@@ -10,8 +10,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from sprite_pipeline.models import ActionPreset
+from sprite_pipeline.models import ActionPreset, CharacterPreset
 from sprite_pipeline.project_profile import DREAMWEAVER_PROFILE
+from sprite_pipeline.prompts import compose_generation_prompt
 
 
 class ProjectAssetContractTests(unittest.TestCase):
@@ -53,6 +54,24 @@ class ProjectAssetContractTests(unittest.TestCase):
                 self.assertEqual(action.generation_frame_selection, list(range(16)))
                 self.assertEqual(action.frame_cells, expected_cells)
                 self.assertEqual((action.sheet_columns, action.sheet_rows), (4, 4))
+
+    def test_ground_attack_prompt_requires_exactly_one_charged_vertical_chop(self) -> None:
+        action = ActionPreset.model_validate(
+            json.loads((PROJECT_ROOT / "presets" / "actions" / "attack.json").read_text(encoding="utf-8"))
+        )
+        character_path = PROJECT_ROOT / "presets" / "characters" / "player_cyber" / "character.json"
+        character = CharacterPreset.model_validate(json.loads(character_path.read_text(encoding="utf-8")))
+        prompt = compose_generation_prompt(character, action)
+
+        self.assertFalse(action.loop)
+        self.assertIn("2-4 sword overhead/shoulder", prompt)
+        self.assertIn("5-7 charge, held at 7", prompt)
+        self.assertIn("8-10 the only forward vertical high-to-low strike", prompt)
+        self.assertIn("14-16 recovery only", prompt)
+        self.assertIn("exactly one attack total", prompt)
+        self.assertIn("after contact: no wind-up/swing; no repeat, second hit, combo, or loop", prompt)
+        self.assertIn("vertical chop only; no horizontal slash, thrust, spin, or projectile", prompt)
+        self.assertLessEqual(len(prompt), 1000)
 
     def test_actions_upgraded_from_lower_counts_are_marked_for_godot_follow_up(self) -> None:
         expected_legacy_counts = {

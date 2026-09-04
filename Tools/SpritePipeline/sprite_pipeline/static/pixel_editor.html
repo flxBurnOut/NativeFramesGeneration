@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>精确像素修补画布</title>
-  <link rel="stylesheet" href="/pixel-editor-assets/pixel_editor.css?v=5">
+  <link rel="stylesheet" href="/pixel-editor-assets/pixel_editor.css?v=6">
 </head>
 <body>
   <main class="editor" id="editor">
@@ -39,7 +39,7 @@
         <button type="button" class="tool is-active" data-tool="pencil" aria-pressed="true" title="铅笔（B）">
           <span aria-hidden="true">✎</span> 铅笔
         </button>
-        <button type="button" class="tool" data-tool="eraser" aria-pressed="false" title="橡皮擦（E）">
+        <button type="button" class="tool" data-tool="eraser" aria-pressed="false" title="橡皮擦（E）：把当前帧原有或新增像素清为透明">
           <span aria-hidden="true">◇</span> 橡皮擦
         </button>
         <button type="button" class="tool" data-tool="eyedropper" aria-pressed="false" title="吸管（I，按住 Alt 可临时使用）">
@@ -92,8 +92,8 @@
 
       <div class="tool-group onion-controls" role="group" aria-label="相邻帧洋葱皮">
         <span class="group-label">洋葱皮</span>
-        <label class="check-label onion-previous"><input type="checkbox" id="previousToggle" checked> 前一帧</label>
-        <label class="check-label onion-next"><input type="checkbox" id="nextToggle" checked> 后一帧</label>
+        <label class="check-label onion-previous"><input type="checkbox" id="previousToggle"> 前一帧</label>
+        <label class="check-label onion-next"><input type="checkbox" id="nextToggle"> 后一帧</label>
         <label for="onionOpacity">浓度</label>
         <input id="onionOpacity" type="range" min="10" max="70" step="5" value="35">
         <span class="zoom-value" id="onionOpacityValue">35%</span>
@@ -136,7 +136,8 @@
           <ul>
             <li>一格就是 PNG 的一个原始像素</li>
             <li>铅笔直接替换 RGBA，不做抗锯齿</li>
-            <li>橡皮擦写入透明黑色 (0,0,0,0)</li>
+            <li>橡皮擦会删除当前帧原有或新增内容，写入透明黑色 (0,0,0,0)</li>
+            <li>透明处显示棋盘格；橡皮擦模式会临时隐藏洋葱皮，避免把相邻帧残影误认为没有擦除</li>
             <li>网格、选区和洋葱皮不会写进 PNG</li>
             <li>填充只匹配四向连通且 RGBA 完全相同的像素</li>
           </ul>
@@ -229,6 +230,6 @@
       armWatchdog();
     })();
   </script>
-  <script type="module" src="/pixel-editor-assets/pixel_editor.js?v=5"></script>
+  <script type="module" src="/pixel-editor-assets/pixel_editor.js?v=6"></script>
 </body>
 </html>

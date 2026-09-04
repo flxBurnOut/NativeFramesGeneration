@@ -47,6 +47,41 @@ export function applyRgbaChanges(buffer, changes, direction) {
   }
 }
 
+export function stampSquareRgba(buffer, width, height, center, size, rgba) {
+  if (
+    !validRgbaBuffer(buffer, width, height) ||
+    !center ||
+    !Number.isFinite(center.x) ||
+    !Number.isFinite(center.y) ||
+    !Number.isInteger(size) ||
+    size < 1 ||
+    !rgba ||
+    rgba.length !== 4
+  ) {
+    return [];
+  }
+  const centerX = Math.floor(center.x);
+  const centerY = Math.floor(center.y);
+  if (centerX < 0 || centerY < 0 || centerX >= width || centerY >= height) return [];
+
+  const replacement = Array.from(new Uint8ClampedArray(rgba));
+  const start = -Math.floor((size - 1) / 2);
+  const changes = [];
+  for (let offsetY = start; offsetY < start + size; offsetY += 1) {
+    for (let offsetX = start; offsetX < start + size; offsetX += 1) {
+      const targetX = centerX + offsetX;
+      const targetY = centerY + offsetY;
+      if (targetX < 0 || targetY < 0 || targetX >= width || targetY >= height) continue;
+      const offset = (targetY * width + targetX) * 4;
+      if (rgbaEquals(buffer, offset, replacement)) continue;
+      const before = Array.from(buffer.slice(offset, offset + 4));
+      changes.push({ offset, before, after: replacement });
+      buffer.set(replacement, offset);
+    }
+  }
+  return changes;
+}
+
 function rgbaEquals(left, leftOffset, right, rightOffset = 0) {
   return (
     left[leftOffset] === right[rightOffset] &&

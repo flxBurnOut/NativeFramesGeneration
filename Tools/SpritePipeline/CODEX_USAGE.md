@@ -24,11 +24,12 @@ On Windows, use `harness.cmd` when PowerShell execution policy blocks
    discover the per-user jobs directory; never assume a repository `work/`.
 5. Never approve a hard failure. When warnings are acceptable, record the
    decision with `approve --acknowledge-warnings --reviewer codex`.
-6. If a frame needs repair, mark it first with `review-frame --status
-   repair_requested --issue <category>`. For a lossless local/manual edit, call
-   `pixel-edit-frame`; these versions do not consume provider credits and are
-   not limited to two. Reserve `replace-frame` for the external/future-AI
-   replacement path, which accepts at most two versions.
+6. For a lossless local/manual edit, call `pixel-edit-frame` directly on any
+   frame in a non-terminal, unexported candidate; saving invalidates that
+   frame's previous review and re-runs QA. These versions do not consume
+   provider credits and are not limited to two. Before using the separately
+   bounded external/future-AI `replace-frame` path, mark the frame with
+   `review-frame --status repair_requested --issue <category>`.
 7. Call `export` only after the candidate status is `approved`. Do not add
    `--overwrite` unless the user explicitly wants to replace an existing staged
    export.
@@ -120,10 +121,9 @@ $jobId = $created.data.job.job_id
 .\harness.ps1 generate --job $jobId
 ```
 
-Mark a bad frame and commit a local pixel-edit PNG:
+Commit a local pixel-edit PNG directly:
 
 ```powershell
-.\harness.ps1 review-frame --job <id> --candidate 1 --frame 5 --status repair_requested --issue weapon_error --note "blade bends and changes length" --reviewer codex
 .\harness.ps1 pixel-edit-frame --job <id> --candidate 1 --frame 5 --source D:\repairs\frame_005.png --base-sha256 <current-frame-sha256> --reviewer codex
 ```
 

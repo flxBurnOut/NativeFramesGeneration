@@ -12,7 +12,7 @@ The same `SpritePipelineService` is used by:
 - PixelLab Animate with Text V3 or an offline diagnostic provider;
 - a JSON-only command line designed for direct Codex orchestration;
 - a loopback REST API for another tool or script;
-- a six-page, project-guided Gradio operator page.
+- a seven-page, project-guided Gradio operator page.
 
 It never writes into formal game asset directories or mixes normal user data
 with source code. Runtime jobs and user character packages default to
@@ -50,16 +50,20 @@ portable/test mode.
   jumps, palette deviation, loop closure, and grounded baseline drift.
 - Original/enlarged GIFs, enlarged indexed grid, adjacent-frame onion skins,
   project reference lines, and a preview sheet.
-- Explicit per-frame review, a full repair timeline with pending, approved,
+- Explicit per-frame review, replay-on-demand, a full repair timeline with pending, approved,
   repair-requested, modified, and blocking states, previous/next-problem
-  navigation, a lossless in-browser pixel editor, unlimited local manual
+  navigation, keep-without-edit for falsely flagged or acceptable frames,
+  a lossless in-browser pixel editor, unlimited local manual
   versions, two separately bounded external/future-AI replacements per bad
   frame, and deterministic staged export.
 - Exported PNG, preview GIF, recipe JSON, and QA JSON.
-- A project-guided UI with Guide & Example, Generate Animation, a separate
-  Saved Assets library, Playback Review, Frame Repair, Export, and API/project
-  settings. Character source upload and identity/action prompts are integrated
-  into generation.
+- A progressively disclosed project UI whose default path is Start → 1 Generate
+  (including reference import) → 2 Playback Review → optional 3 Frame Repair →
+  4 Export.
+  Every stage provides an explicit next action; approval opens and populates
+  Export automatically. Recovery, raw records, existing-sheet import, and
+  external whole-frame replacement remain available in clearly labelled
+  secondary panels. The Asset Library and Settings sit outside the main path.
 - A bundled Dreamweaver / Cyber Warrior profile: 128×128 RGBA cells, four
   columns, anchor (64,106), and a uniform sixteen-frame 4x4 / 512x512 output
   sheet for every new action while retaining project timing and filenames.
@@ -71,9 +75,11 @@ portable/test mode.
   sheets instead of discarding existing or already-paid artwork.
 
 PixelLab Edit Animation V2 and GPT-Image-2 automatic repair are intentionally
-not in V0.1. The built-in editor already provides exact RGBA pencil, eraser,
+not in V0.1. The built-in editor already provides exact RGBA pencil and an
+eraser that clears both generated and newly painted pixels to transparent black,
 eyedropper, exact four-connected fill, rectangular selection with integer-pixel
-nudge, previous/next onion skins, position deltas, integer zoom, a non-exported
+nudge, opt-in previous/next onion skins that are temporarily hidden while erasing,
+position deltas, integer zoom, a non-exported
 pixel grid, pan, undo/redo, bounded crash-recovery drafts, and verified manual
 versions. Manual-save and QA status are reported separately, so a durable
 version cannot be misreported as lost when a later preview check fails. A
@@ -295,7 +301,10 @@ Existing completed Sheets can be uploaded only from Playback Review, where a
 numbered grid is shown before they enter inspection. Frame Repair embeds the
 exact-pixel editor and a full five-state frame timeline. It can jump to the
 previous or next problem frame and preserves the current job, candidate, and
-frame after saves, rechecks, and external replacements. For looping actions,
+frame after saves, rechecks, and external replacements. Any frame in a
+non-terminal, unexported candidate can be edited directly; only the bounded
+external full-frame replacement still requires a repair-requested review mark.
+For looping actions,
 the last frame is the first frame's “loop previous” neighbor and the first frame
 is the last frame's “loop next” neighbor. External PNG upload remains a
 collapsed, provenance-bound fallback.

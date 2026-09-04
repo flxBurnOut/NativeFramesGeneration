@@ -2721,8 +2721,7 @@ class SpritePipelineService:
             "review_status": frame.review_status.value,
             "candidate_status": candidate.status.value,
             "can_edit": (
-                frame.review_status == ReviewStatus.repair_requested
-                and candidate.status not in {
+                candidate.status not in {
                     CandidateStatus.approved,
                     CandidateStatus.rejected,
                     CandidateStatus.failed,
@@ -2785,16 +2784,6 @@ class SpritePipelineService:
                         "received_sha256": base_sha256,
                     },
                 )
-            if frame.review_status != ReviewStatus.repair_requested:
-                raise ConflictError(
-                    "frame must be explicitly marked repair_requested before pixel editing",
-                    details={
-                        "reason": "frame_not_marked_for_repair",
-                        "frame_index": frame_index,
-                        "review_status": frame.review_status.value,
-                    },
-                )
-
             active_source = self.store.resolve_job_path(job_id, frame.active_path)
             if sha256_file(active_source) != frame.sha256:
                 raise ConflictError(

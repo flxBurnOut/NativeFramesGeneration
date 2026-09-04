@@ -121,7 +121,7 @@ DREAMWEAVER_PROFILE = ProjectProfile(
         ProjectAction(
             "attack", "attack", "地面攻击", "赛博人物攻击.png", 16, 16, 18, 18, False,
             4, 4, _row_major_cells(16), (6,), integration_status="frame_upgrade",
-            note="新合同使用完整 16 帧；第 7 帧（索引 6）作为蓄力/技能定格姿势，替换旧资产时需要同步 Godot 帧列表。",
+            note="新合同使用完整 16 帧；整段只攻击一次，第 7 帧（索引 6）作为刀举过头或肩侧的唯一蓄力/技能定格姿势，随后向前纵向劈砍并只做跟随与恢复；替换旧资产时需要同步 Godot 帧列表。",
             legacy_sheet_rows=2,
             legacy_frame_cells=((0, 0), (2, 0), (1, 1), (2, 1), (3, 1)),
         ),

@@ -1821,8 +1821,123 @@ class SpritePipelineIntegrationTests(unittest.TestCase):
 
         reloaded = self.service.get_frame_edit_session(saved.job_id, 1, 0)
         self.assertEqual(reloaded["rgba"], bytes(edited))
-        self.assertFalse(reloaded["can_edit"])
+        self.assertTrue(reloaded["can_edit"])
         self.assertEqual(reloaded["manual_edit_versions"], 1)
+
+    def test_manual_pixel_edit_can_start_on_an_unmarked_neighbor_frame(self) -> None:
+        checked = self._ingest_clean_candidate()
+        self.service.review_frame(
+            checked.job_id,
+            1,
+            {
+                "frame_index": 0,
+                "status": "repair_requested",
+                "issue_type": IssueType.other.value,
+                "reviewer": "neighbor-edit-test",
+            },
+        )
+        original = self._candidate(self.service.get_job(checked.job_id)).frames[1]
+        self.assertEqual(original.review_status, ReviewStatus.pending)
+        original_raw_path = original.raw_path
+        original_raw_bytes = self.service.store.resolve_job_path(
+            checked.job_id,
+            original_raw_path,
+        ).read_bytes()
+
+        session = self.service.get_frame_edit_session(checked.job_id, 1, 1)
+        self.assertTrue(session["can_edit"])
+        edited = bytearray(session["rgba"])
+        opaque_offset = next(
+            offset for offset in range(0, len(edited), 4) if edited[offset + 3] > 0
+        )
+        edited[opaque_offset : opaque_offset + 4] = bytes((0, 0, 0, 0))
+
+        saved = self.service.edit_frame_pixels(
+            checked.job_id,
+            1,
+            1,
+            rgba=bytes(edited),
+            width=session["width"],
+            height=session["height"],
+            base_sha256=session["base_sha256"],
+            reviewer="neighbor-edit-test",
+        )
+
+        frame = self._candidate(saved).frames[1]
+        self.assertEqual(frame.manual_edit_versions, 1)
+        self.assertEqual(frame.review_status, ReviewStatus.pending)
+        self.assertEqual(frame.raw_path, original_raw_path)
+        with Image.open(self.service.store.resolve_job_path(saved.job_id, frame.active_path)) as opened:
+            saved_rgba = opened.convert("RGBA").tobytes()
+        self.assertEqual(saved_rgba[opaque_offset : opaque_offset + 4], bytes((0, 0, 0, 0)))
+        self.assertEqual(
+            self.service.store.resolve_job_path(saved.job_id, original_raw_path).read_bytes(),
+            original_raw_bytes,
+        )
+        self.assertTrue(self.service.get_frame_edit_session(saved.job_id, 1, 1)["can_edit"])
+
+    def test_manual_pixel_editor_keeps_terminal_candidate_read_only(self) -> None:
+        checked = self._ingest_clean_candidate()
+        approved = self.service.approve_candidate(
+            checked.job_id,
+            1,
+            reviewer="terminal-edit-test",
+            acknowledge_warnings=True,
+        )
+        session = self.service.get_frame_edit_session(approved.job_id, 1, 1)
+        self.assertFalse(session["can_edit"])
+        edited = bytearray(session["rgba"])
+        edited[0:4] = bytes((1, 2, 3, 255))
+        with self.assertRaisesRegex(ConflictError, "terminal candidate"):
+            self.service.edit_frame_pixels(
+                approved.job_id,
+                1,
+                1,
+                rgba=bytes(edited),
+                width=session["width"],
+                height=session["height"],
+                base_sha256=session["base_sha256"],
+            )
+
+    def test_modified_frame_can_be_reapproved_and_exported(self) -> None:
+        checked = self._ingest_clean_candidate()
+        session = self.service.get_frame_edit_session(checked.job_id, 1, 0)
+        edited = bytearray(session["rgba"])
+        opaque_offset = next(
+            offset for offset in range(0, len(edited), 4) if edited[offset + 3] > 0
+        )
+        edited[opaque_offset : opaque_offset + 4] = bytes((0, 0, 0, 0))
+
+        saved = self.service.edit_frame_pixels(
+            checked.job_id,
+            1,
+            0,
+            rgba=bytes(edited),
+            width=session["width"],
+            height=session["height"],
+            base_sha256=session["base_sha256"],
+            reviewer="export-after-edit-test",
+        )
+        saved_candidate = self._candidate(saved)
+        self.assertEqual(saved_candidate.status, CandidateStatus.review_ready)
+        self.assertEqual(saved_candidate.frames[0].review_status, ReviewStatus.pending)
+
+        approved = self.service.approve_candidate(
+            saved.job_id,
+            1,
+            reviewer="export-after-edit-test",
+            acknowledge_warnings=True,
+        )
+        self.assertEqual(self._candidate(approved).status, CandidateStatus.approved)
+        exported = self.service.export_candidate(approved.job_id, 1)
+        self.assertIsNotNone(exported.export)
+        assert exported.export is not None
+        exported_sheet = self.service.settings.resolve_record_path(exported.export.sheet_path)
+        self.assertTrue(exported_sheet.is_file())
+        x = (opaque_offset // 4) % session["width"]
+        y = (opaque_offset // 4) // session["width"]
+        with Image.open(exported_sheet) as sheet:
+            self.assertEqual(sheet.convert("RGBA").getpixel((x, y)), (0, 0, 0, 0))
 
     def test_manual_pixel_edit_reports_real_stale_conflict_between_two_windows(self) -> None:
         checked = self._ingest_clean_candidate()
@@ -2357,9 +2472,9 @@ class SpritePipelineIntegrationTests(unittest.TestCase):
             self.assertIn("洋葱皮", page.text)
             self.assertIn("retryLoadButton", page.text)
             self.assertIn("__spritePixelEditorBoot", page.text)
-            self.assertIn("pixel_editor.css?v=5", page.text)
-            self.assertIn("pixel_editor.js?v=5", page.text)
-            script = client.get("/pixel-editor-assets/pixel_editor.js?v=5")
+            self.assertIn("pixel_editor.css?v=6", page.text)
+            self.assertIn("pixel_editor.js?v=6", page.text)
+            script = client.get("/pixel-editor-assets/pixel_editor.js?v=6")
             self.assertEqual(script.status_code, 200)
             self.assertEqual(script.headers["cache-control"], "no-store, max-age=0")
             self.assertIn("imageSmoothingEnabled = false", script.text)
@@ -2378,7 +2493,12 @@ class SpritePipelineIntegrationTests(unittest.TestCase):
                 session["width"] * session["height"] * 4,
             )
             pixels = bytearray(base64.b64decode(session["rgba_base64"]))
-            pixels[0:4] = bytes((91, 92, 93, 255))
+            opaque_offset = next(
+                offset for offset in range(0, len(pixels), 4) if pixels[offset + 3] > 0
+            )
+            original_pixel = bytes(pixels[opaque_offset : opaque_offset + 4])
+            self.assertNotEqual(original_pixel, bytes((0, 0, 0, 0)))
+            pixels[opaque_offset : opaque_offset + 4] = bytes((0, 0, 0, 0))
             saved = client.post(
                 f"/v1/jobs/{checked.job_id}/candidates/1/frames/0/pixel-edit",
                 json={
@@ -2394,6 +2514,17 @@ class SpritePipelineIntegrationTests(unittest.TestCase):
             self.assertTrue(edit["saved"])
             self.assertTrue(edit["qa"]["ok"])
             self.assertEqual(edit["manual_edit_versions"], 1)
+            reloaded = client.get(
+                f"/v1/jobs/{checked.job_id}/candidates/1/frames/0/pixel-edit"
+            )
+            self.assertEqual(reloaded.status_code, 200)
+            reloaded_pixels = base64.b64decode(
+                reloaded.json()["data"]["session"]["rgba_base64"]
+            )
+            self.assertEqual(
+                reloaded_pixels[opaque_offset : opaque_offset + 4],
+                bytes((0, 0, 0, 0)),
+            )
 
     def test_codex_cli_can_commit_a_manual_pixel_edit_version(self) -> None:
         checked = self._ingest_clean_candidate()

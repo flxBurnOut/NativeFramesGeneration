@@ -8,9 +8,10 @@ import {
   opaqueBoundsRgba,
   rasterIntegerLine,
   screenToPixel,
+  stampSquareRgba,
   threeWayMergeRgba,
   translateSelectionRgba,
-} from "/pixel-editor-assets/pixel_editor_core.js?v=5";
+} from "/pixel-editor-assets/pixel_editor_core.js?v=6";
 
 const $ = (selector) => document.querySelector(selector);
 
@@ -298,13 +299,6 @@ function getPixel(x, y) {
   ];
 }
 
-function setPixelAtOffset(offset, rgba) {
-  state.pixels[offset] = rgba[0];
-  state.pixels[offset + 1] = rgba[1];
-  state.pixels[offset + 2] = rgba[2];
-  state.pixels[offset + 3] = rgba[3];
-}
-
 function hexToRgb(hex) {
   const normalized = hex.replace("#", "");
   return [
@@ -426,7 +420,8 @@ function renderImage() {
   refreshSourceCanvas();
   const opacity = Number.parseInt(elements.onionOpacity.value, 10) / 100;
   imageContext.globalAlpha = opacity;
-  if (elements.previousToggle.checked && state.neighbors.previous) {
+  const showOnionSkin = state.tool !== "eraser";
+  if (showOnionSkin && elements.previousToggle.checked && state.neighbors.previous) {
     imageContext.drawImage(
       previousCanvas,
       state.originX,
@@ -435,7 +430,7 @@ function renderImage() {
       state.height * state.zoom,
     );
   }
-  if (elements.nextToggle.checked && state.neighbors.next) {
+  if (showOnionSkin && elements.nextToggle.checked && state.neighbors.next) {
     imageContext.drawImage(
       nextCanvas,
       state.originX,
@@ -599,26 +594,19 @@ function activeRgba() {
   return state.tool === "eraser" ? [0, 0, 0, 0] : paintColor();
 }
 
-function recordBefore(offset) {
-  if (!state.strokeBefore.has(offset)) {
-    state.strokeBefore.set(offset, Array.from(state.pixels.slice(offset, offset + 4)));
-  }
-}
-
 function stampPixel(x, y) {
   const size = Number.parseInt(elements.brushSize.value, 10);
-  const start = -Math.floor((size - 1) / 2);
-  const rgba = activeRgba();
-  for (let offsetY = start; offsetY < start + size; offsetY += 1) {
-    for (let offsetX = start; offsetX < start + size; offsetX += 1) {
-      const targetX = x + offsetX;
-      const targetY = y + offsetY;
-      if (targetX < 0 || targetY < 0 || targetX >= state.width || targetY >= state.height) continue;
-      const offset = pixelOffset(targetX, targetY);
-      const current = state.pixels.slice(offset, offset + 4);
-      if (current.every((value, index) => value === rgba[index])) continue;
-      recordBefore(offset);
-      setPixelAtOffset(offset, rgba);
+  const changes = stampSquareRgba(
+    state.pixels,
+    state.width,
+    state.height,
+    { x, y },
+    size,
+    activeRgba(),
+  );
+  for (const change of changes) {
+    if (!state.strokeBefore.has(change.offset)) {
+      state.strokeBefore.set(change.offset, change.before);
     }
   }
 }
@@ -1037,6 +1025,7 @@ function resetDraft() {
 }
 
 function selectTool(tool) {
+  const previousTool = state.tool;
   state.tool = tool;
   for (const button of document.querySelectorAll("[data-tool]")) {
     const selected = button.dataset.tool === tool;
@@ -1046,7 +1035,17 @@ function selectTool(tool) {
   elements.viewport.classList.toggle("is-eyedropper", tool === "eyedropper");
   elements.viewport.classList.toggle("is-fill", tool === "fill");
   elements.viewport.classList.toggle("is-selection", tool === "select");
-  if (state.loaded) renderOverlay();
+  if (state.loaded) {
+    render();
+    if (tool === "eraser") {
+      setMessage(
+        "橡皮擦会直接把当前帧的原有或新增像素清为完全透明。为避免相邻帧残影造成误判，橡皮擦模式会临时隐藏洋葱皮。",
+        "info",
+      );
+    } else if (previousTool === "eraser") {
+      setMessage("已退出橡皮擦；你原来的洋葱皮显示选择已恢复。", "info");
+    }
+  }
 }
 
 function setZoom(nextZoom, anchor = null) {
@@ -1456,7 +1455,8 @@ async function loadSession() {
       state.neighbors.previous.sha256 === state.neighbors.next.sha256
     );
     elements.previousToggle.disabled = !state.neighbors.previous;
-    elements.nextToggle.checked = !duplicateLoopNeighbor && Boolean(state.neighbors.next);
+    if (!state.neighbors.previous) elements.previousToggle.checked = false;
+    if (!state.neighbors.next || duplicateLoopNeighbor) elements.nextToggle.checked = false;
     elements.nextToggle.disabled = !state.neighbors.next || duplicateLoopNeighbor;
     elements.previousToggle.parentElement.title = state.neighbors.previous
       ? (duplicateLoopNeighbor ? "前后都是第 " : "洋红色：第 ") +
@@ -1487,7 +1487,7 @@ async function loadSession() {
         missingReferences ? "info" : "ok",
       );
     } else {
-      setMessage("当前帧不是待修补状态，可以检查像素，但保存前需要在“播放检查”重新标记。", "info");
+      setMessage("当前候选已进入不可修改状态（已批准、拒绝、失败或导出），这里只能检查像素。", "info");
     }
     window.__spritePixelEditorBoot?.markReady?.();
   } catch (error) {
@@ -1547,7 +1547,7 @@ elements.overlayCanvas.addEventListener("pointerdown", (event) => {
     return;
   }
   if (!state.canEdit) {
-    setMessage("当前帧不是待修补状态，暂时不能修改。请先在播放检查中标记。", "error");
+    setMessage("当前候选已进入不可修改状态，不能再写入像素；请返回外层页面选择仍可修补的候选。", "error");
     return;
   }
   if (state.tool === "fill") {

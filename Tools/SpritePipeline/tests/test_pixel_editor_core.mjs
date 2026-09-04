@@ -17,6 +17,7 @@ const {
   opaqueBoundsRgba,
   rasterIntegerLine,
   screenToPixel,
+  stampSquareRgba,
   threeWayMergeRgba,
   translateSelectionRgba,
 } = await import(pathToFileURL(modulePath));
@@ -78,6 +79,48 @@ applyRgbaChanges(rgba, changes, "redo");
 assert.deepEqual(Array.from(rgba), [1, 2, 3, 255, 40, 50, 60, 128]);
 applyRgbaChanges(rgba, changes, "undo");
 assert.deepEqual(Array.from(rgba), [0, 0, 0, 0, 10, 20, 30, 255]);
+
+const originalFramePixels = new Uint8ClampedArray([
+  12, 34, 56, 255,
+  78, 90, 123, 128,
+  0, 0, 0, 0,
+]);
+const erasedOriginal = stampSquareRgba(
+  originalFramePixels,
+  3,
+  1,
+  { x: 0, y: 0 },
+  1,
+  [0, 0, 0, 0],
+);
+assert.equal(erasedOriginal.length, 1);
+assert.deepEqual(Array.from(originalFramePixels.slice(0, 4)), [0, 0, 0, 0]);
+assert.deepEqual(Array.from(originalFramePixels.slice(4, 8)), [78, 90, 123, 128]);
+applyRgbaChanges(originalFramePixels, erasedOriginal, "undo");
+assert.deepEqual(Array.from(originalFramePixels.slice(0, 4)), [12, 34, 56, 255]);
+applyRgbaChanges(originalFramePixels, erasedOriginal, "redo");
+assert.deepEqual(Array.from(originalFramePixels.slice(0, 4)), [0, 0, 0, 0]);
+
+const paintedPixel = stampSquareRgba(
+  originalFramePixels,
+  3,
+  1,
+  { x: 2, y: 0 },
+  1,
+  [210, 110, 10, 255],
+);
+assert.equal(paintedPixel.length, 1);
+assert.deepEqual(Array.from(originalFramePixels.slice(8, 12)), [210, 110, 10, 255]);
+const erasedPaint = stampSquareRgba(
+  originalFramePixels,
+  3,
+  1,
+  { x: 2, y: 0 },
+  1,
+  [0, 0, 0, 0],
+);
+assert.equal(erasedPaint.length, 1);
+assert.deepEqual(Array.from(originalFramePixels.slice(8, 12)), [0, 0, 0, 0]);
 
 for (let x = -4; x <= 4; x += 1) {
   for (let y = -4; y <= 4; y += 1) {
