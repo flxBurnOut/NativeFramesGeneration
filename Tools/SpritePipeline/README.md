@@ -327,3 +327,7 @@ contract for every action. Existing lower-frame assets remain valid import and
 review inputs. Jump, ground attack, air attack, and hurt need their Godot frame
 lists updated before replacement; backward evade still requires a new animation
 and state mapping because it is not present in the supplied project manifest.
+
+## License
+
+This project is released under the [MIT License](LICENSE).

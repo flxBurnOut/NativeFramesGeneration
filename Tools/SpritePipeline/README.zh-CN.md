@@ -204,3 +204,7 @@ Codex 也可用 `pixel-edit-frame --source <同尺寸透明 PNG> --base-sha256 <
 V0.1 暂未自动调用 PixelLab Edit Animation V2 或 GPT-Image-2；当前已经支持内置手工像素修补、REST RGBA 修补和 Codex `pixel-edit-frame`，外部修补 PNG 仍可通过 `replace-frame` 加入。复制粘贴、可编辑遮罩、调色板保护、修改前后闪烁和 AI 遮罩修补属于后续阶段。空白仓库也没有可修改的 Godot 工程，因此独立 Godot 预览场景仍需在真实项目接入时补做。
 
 统一 Python/Node 回归用于检查服务、像素算法和页面结构，但真实浏览器中的载入、绘制、撤销/重做、保存、重载及逐字节核对烟测尚未执行，当前不能声称浏览器烟测已经通过。后续实现顺序见 [逐帧修补优化计划](PIXEL_REPAIR_OPTIMIZATION_PLAN.md)。
+
+## 许可证
+
+本项目以 [MIT License](LICENSE) 发布。
